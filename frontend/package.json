@@ -1,0 +1,25 @@
+{
+  "name": "meterbill-console",
+  "private": true,
+  "version": "1.0.0",
+  "type": "module",
+  "scripts": {
+    "dev": "vite --host 0.0.0.0 --port 5173",
+    "build": "vue-tsc -b && vite build",
+    "typecheck": "vue-tsc -b --pretty false"
+  },
+  "dependencies": {
+    "@element-plus/icons-vue": "latest",
+    "axios": "latest",
+    "element-plus": "latest",
+    "pinia": "latest",
+    "vue": "latest",
+    "vue-router": "^4.6.3"
+  },
+  "devDependencies": {
+    "@vitejs/plugin-vue": "latest",
+    "typescript": "~5.9.3",
+    "vite": "latest",
+    "vue-tsc": "latest"
+  }
+}

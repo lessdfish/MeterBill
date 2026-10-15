@@ -1,0 +1,115 @@
+spring:
+  application:
+    name: meterbill
+  task:
+    scheduling:
+      pool:
+        size: 2
+
+  config:
+    import: 'optional:file:./.env[.properties]'
+
+  datasource:
+    url: jdbc:mysql://${MYSQL_HOST:127.0.0.1}:${MYSQL_HOST_PORT:13306}/${MYSQL_DATABASE:meterbill}?connectionTimeZone=UTC&forceConnectionTimeZoneToSession=true
+    username: ${MYSQL_USER:meterbill}
+    password: ${MYSQL_PASSWORD}
+    driver-class-name: com.mysql.cj.jdbc.Driver
+
+    hikari:
+      maximum-pool-size: ${METERBILL_DB_POOL:16}
+      minimum-idle: 2
+      connection-timeout: 30000
+
+  rabbitmq:
+    host: ${RABBITMQ_HOST:127.0.0.1}
+    port: ${RABBITMQ_HOST_PORT:5672}
+    username: ${RABBITMQ_USER:meterbill}
+    password: ${RABBITMQ_PASSWORD:}
+    publisher-confirm-type: correlated
+    publisher-returns: true
+    template:
+      mandatory: true
+    listener:
+      simple:
+        acknowledge-mode: manual
+        concurrency: ${METERBILL_CONSUMERS:4}
+        max-concurrency: ${METERBILL_CONSUMERS:4}
+        prefetch: ${METERBILL_PREFETCH:32}
+
+  data:
+    redis:
+      host: ${REDIS_HOST:127.0.0.1}
+      port: ${REDIS_HOST_PORT:16379}
+      password: ${REDIS_PASSWORD:}
+      connect-timeout: 2s
+      timeout: 2s
+
+  flyway:
+    enabled: true
+    locations: classpath:db/migration
+    validate-on-migrate: true
+    validate-migration-naming: true
+
+server:
+  port: 8085
+  tomcat:
+    threads:
+      max: 200
+      min-spare: 10
+    accept-count: 100
+    max-connections: 8192
+
+management:
+  endpoints:
+    web:
+      exposure:
+        include: health,info,prometheus
+  endpoint:
+    health:
+      probes:
+        enabled: true
+      group:
+        liveness:
+          include: livenessState,ping
+        readiness:
+          include: readinessState,db,rabbit,redis
+  metrics:
+    tags:
+      application: ${spring.application.name}
+logging:
+  pattern:
+    level: "%5p [requestId:%X{requestId:-}]"
+
+
+mybatis-plus:
+  mapper-locations: classpath*:/mapper/**/*.xml
+  configuration:
+    map-underscore-to-camel-case: true
+
+meterbill:
+  messaging:
+    enabled: true
+    dispatch-interval: ${METERBILL_DISPATCH_INTERVAL:20}
+    dispatch-batch-size: ${METERBILL_DISPATCH_BATCH:128}
+  jobs:
+    enabled: true
+    invoice-recovery-interval: 60000
+  redisson:
+    enabled: true
+    host: ${REDIS_HOST:127.0.0.1}
+    port: ${REDIS_HOST_PORT:16379}
+    password: ${REDIS_PASSWORD:}
+  redis-cache:
+    enabled: true
+    usage-meter-ttl: 10m
+  auth:
+    issuer: meterbill
+    audience: meterbill-api
+    access-token-minutes: 60
+    jwt-secret-base64: ${METERBILL_JWT_SECRET_BASE64}
+
+  bootstrap:
+    enabled: false
+    email: ${METERBILL_BOOTSTRAP_EMAIL:}
+    password: ${METERBILL_BOOTSTRAP_PASSWORD:}
+    tenant-code: ${METERBILL_BOOTSTRAP_TENANT_CODE:}

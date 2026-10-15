@@ -1,0 +1,12 @@
+.git
+.github
+.ai
+.env
+.env.*
+!.env.example
+target
+frontend/node_modules
+frontend/dist
+docs/prototypes/**/node_modules
+tests/results
+*.log

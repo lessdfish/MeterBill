@@ -1,0 +1,24 @@
+groups:
+  - name: meterbill-business
+    rules:
+      - alert: MeterBillOutboxBacklog
+        expr: meterbill_outbox_backlog > 0
+        for: 15s
+        labels:
+          severity: warning
+        annotations:
+          summary: MeterBill Outbox has unpublished rows
+      - alert: MeterBillOldestOutboxDelayed
+        expr: meterbill_outbox_oldest_age_seconds > 60
+        for: 15s
+        labels:
+          severity: critical
+        annotations:
+          summary: MeterBill oldest Outbox row is delayed
+      - alert: MeterBillReconciliationDifferences
+        expr: meterbill_reconciliation_differences > 0
+        for: 15s
+        labels:
+          severity: warning
+        annotations:
+          summary: MeterBill has unresolved reconciliation differences

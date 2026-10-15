@@ -1,0 +1,101 @@
+name: MeterBill release
+
+on:
+  push:
+    branches: [main]
+    tags: ["v*"]
+  workflow_dispatch:
+    inputs:
+      deploy:
+        description: Deploy after publishing images
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+  packages: write
+
+env:
+  APP_IMAGE: ghcr.io/${{ github.repository_owner }}/meterbill-app
+  GATEWAY_IMAGE: ghcr.io/${{ github.repository_owner }}/meterbill-gateway
+  VERSION: ${{ github.ref_type == 'tag' && github.ref_name || github.sha }}
+
+jobs:
+  verify:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-java@v4
+        with: { distribution: temurin, java-version: "21", cache: maven }
+      - uses: actions/setup-node@v4
+        with: { node-version: "22", cache: npm, cache-dependency-path: frontend/package-lock.json }
+      - run: mvn -B -DskipTests compile
+      - run: mvn -B '-Dtest=ConsoleQueryIntegrationTest,SubscriptionIntegrationTest' test
+      - working-directory: frontend
+        run: npm ci && npm run build
+      - run: docker compose --env-file deploy/.env.example -f deploy/compose.yaml config -q
+      - name: Record verification evidence
+        run: |
+          mkdir -p build-evidence
+          printf 'commit=%s\nversion=%s\nrun=%s\n' "$GITHUB_SHA" "$VERSION" "$GITHUB_RUN_ID" > build-evidence/release.txt
+      - name: Upload verification evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: verification-${{ github.run_id }}
+          path: |
+            build-evidence/release.txt
+            target/surefire-reports/**
+            frontend/dist/**
+          if-no-files-found: warn
+          retention-days: 30
+
+  publish:
+    needs: verify
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: docker/login-action@v3
+        with: { registry: ghcr.io, username: "${{ github.actor }}", password: "${{ secrets.GITHUB_TOKEN }}" }
+      - uses: docker/setup-buildx-action@v3
+      - uses: docker/build-push-action@v6
+        id: app-image
+        with:
+          context: .
+          target: app
+          push: true
+          tags: ${{ env.APP_IMAGE }}:${{ env.VERSION }}
+          build-args: APP_VERSION=${{ env.VERSION }}
+      - uses: docker/build-push-action@v6
+        id: gateway-image
+        with:
+          context: .
+          target: gateway
+          push: true
+          tags: ${{ env.GATEWAY_IMAGE }}:${{ env.VERSION }}
+          build-args: APP_VERSION=${{ env.VERSION }}
+      - name: Record immutable image digests
+        run: |
+          printf 'app=%s@%s\n' "$APP_IMAGE" '${{ steps.app-image.outputs.digest }}' >> "$GITHUB_STEP_SUMMARY"
+          printf 'gateway=%s@%s\n' "$GATEWAY_IMAGE" '${{ steps.gateway-image.outputs.digest }}' >> "$GITHUB_STEP_SUMMARY"
+
+  deploy:
+    if: github.event_name == 'workflow_dispatch' && inputs.deploy
+    needs: publish
+    runs-on: ubuntu-latest
+    environment: production
+    steps:
+      - uses: actions/checkout@v4
+      - name: Deploy through SSH with backup and rollback
+        env:
+          DEPLOY_HOST: ${{ secrets.DEPLOY_HOST }}
+          DEPLOY_USER: ${{ secrets.DEPLOY_USER }}
+          DEPLOY_SSH_KEY: ${{ secrets.DEPLOY_SSH_KEY }}
+        run: |
+          install -m 700 -d ~/.ssh
+          printf '%s' "$DEPLOY_SSH_KEY" > ~/.ssh/id_ed25519
+          chmod 600 ~/.ssh/id_ed25519
+          ssh-keyscan -H "$DEPLOY_HOST" >> ~/.ssh/known_hosts
+          tar -czf meterbill-deploy.tgz deploy/compose.yaml deploy/nginx deploy/prometheus.yml deploy/scripts ops/prometheus/rules
+          scp meterbill-deploy.tgz "$DEPLOY_USER@$DEPLOY_HOST:/tmp/meterbill-deploy.tgz"
+          ssh "$DEPLOY_USER@$DEPLOY_HOST" "mkdir -p /opt/meterbill && tar -xzf /tmp/meterbill-deploy.tgz -C /opt/meterbill && rm /tmp/meterbill-deploy.tgz && cd /opt/meterbill && sh deploy/scripts/deploy.sh '${VERSION}'"

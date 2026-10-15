@@ -1,0 +1,22 @@
+<script setup lang="ts">
+import { onMounted, ref } from 'vue'
+import { ElMessage, ElMessageBox } from 'element-plus'
+import { api,unwrap } from '../api/client'
+import { useAuthStore } from '../stores/auth'
+import { useListQuery } from '../composables/useListQuery'
+import type { PageResponse } from '../types'
+import MBPageHeader from '../components/MBPageHeader.vue'
+import MBStatusTag from '../components/MBStatusTag.vue'
+
+const auth=useAuthStore(); const {query,syncQuery}=useListQuery({page:1,size:20,status:''}); const result=ref<PageResponse<any>>({page:1,size:20,total:0,records:[]})
+const loading=ref(false); const retrying=ref<number|null>(null); const drawer=ref(false); const selected=ref<any>(null)
+const date=(value?:string)=>value?new Date(value).toLocaleString('zh-CN',{hour12:false}):'—'
+async function load(){loading.value=true;try{await syncQuery();result.value=unwrap(await api.get('/tenant/operations/tasks',{params:query}))}finally{loading.value=false}}
+function open(row:any){selected.value=row;drawer.value=true}
+async function retry(row:any){await ElMessageBox.confirm(`将重新投递用量事件 ${row.referenceId}。服务端只允许 FINAL_FAILED 任务执行此操作。`,'确认重试',{type:'warning',confirmButtonText:'确认重试',cancelButtonText:'取消'});retrying.value=row.id;try{await api.post(`/platform/operations/usage-events/${row.referenceId}/retry`);ElMessage.success('任务已重新进入投递队列');drawer.value=false;await load()}finally{retrying.value=null}}
+onMounted(load)
+</script>
+<template><MBPageHeader title="异常任务" subtitle="查看失败原因、重试次数和最终状态；仅最终失败的用量任务允许人工重试。"/><section class="mb-card table-card"><div class="filter-bar"><el-select v-model="query.status" clearable placeholder="未发布状态"><el-option v-for="s in ['READY','PUBLISHING','RETRYABLE_FAILED','FINAL_FAILED','PUBLISHED']" :key="s" :value="s" :label="s"/></el-select><el-button type="primary" @click="query.page=1;load()">查询</el-button></div><el-table v-loading="loading" :data="result.records" @row-click="open"><el-table-column prop="id" label="任务ID" width="100"/><el-table-column prop="taskType" label="任务类型" min-width="170"/><el-table-column prop="referenceType" label="关联类型" width="140"/><el-table-column prop="referenceId" label="关联对象" width="140"/><el-table-column prop="attemptCount" label="重试次数" width="100"/><el-table-column prop="error" label="错误信息" min-width="280" show-overflow-tooltip/><el-table-column label="下次重试" min-width="190"><template #default="{row}">{{ date(row.nextRetryAt) }}</template></el-table-column><el-table-column label="状态" width="130"><template #default="{row}"><MBStatusTag :status="row.status"/></template></el-table-column><el-table-column label="操作" width="100"><template #default="{row}"><el-button text type="primary" :loading="retrying===row.id" :disabled="!auth.profile?.platformAdmin||row.status!=='FINAL_FAILED'" @click.stop="retry(row)">重试</el-button></template></el-table-column></el-table><el-empty v-if="!loading&&!result.records.length" description="当前租户没有待处理异常任务"/><div class="pagination"><el-pagination v-model:current-page="query.page" v-model:page-size="query.size" :page-sizes="[10,20,50,100]" :total="result.total" layout="total, sizes, prev, pager, next" @current-change="load" @size-change="query.page=1;load()"/></div></section>
+  <el-drawer v-model="drawer" size="min(520px, 92vw)" title="任务详情"><template v-if="selected"><div class="task-title"><h2 class="mono">TASK-{{ selected.id }}</h2><MBStatusTag :status="selected.status"/></div><el-descriptions :column="1" border><el-descriptions-item label="任务类型">{{ selected.taskType }}</el-descriptions-item><el-descriptions-item label="关联对象">{{ selected.referenceType }} / {{ selected.referenceId }}</el-descriptions-item><el-descriptions-item label="已尝试次数">{{ selected.attemptCount }}</el-descriptions-item><el-descriptions-item label="创建时间">{{ date(selected.createdAt) }}</el-descriptions-item><el-descriptions-item label="下次重试">{{ date(selected.nextRetryAt) }}</el-descriptions-item></el-descriptions><h3>最后错误</h3><div class="error-box">{{ selected.error||'没有错误信息' }}</div><el-button type="primary" :loading="retrying===selected.id" :disabled="!auth.profile?.platformAdmin||selected.status!=='FINAL_FAILED'" @click="retry(selected)">重新投递任务</el-button></template></el-drawer>
+</template>
+<style scoped>.task-title{display:flex;align-items:center;gap:12px;margin-bottom:20px}.task-title h2{margin:0}.error-box{padding:14px;margin:10px 0 20px;background:#fff7f7;border:1px solid #fecaca;border-radius:7px;color:#991b1b;font:12px/1.6 "Cascadia Mono",Consolas,monospace;white-space:pre-wrap}</style>

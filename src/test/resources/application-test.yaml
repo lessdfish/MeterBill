@@ -1,0 +1,13 @@
+meterbill:
+  messaging:
+    enabled: false
+  jobs:
+    enabled: false
+  redisson:
+    enabled: false
+  redis-cache:
+    enabled: false
+  auth:
+    jwt-secret-base64: MDEyMzQ1Njc4OWFiY2RlZjAxMjM0NTY3ODlhYmNkZWY=
+  bootstrap:
+    enabled: false

@@ -1,0 +1,26 @@
+:root {
+  font-family: "Microsoft YaHei UI", "PingFang SC", "Microsoft YaHei", sans-serif;
+  color: #122143;
+  background: #f5f8fb;
+  font-synthesis: none;
+  --mb-bg: #f5f8fb;
+  --mb-card: #ffffff;
+  --mb-text: #122143;
+  --mb-muted: #687899;
+  --mb-line: #dfe6ef;
+  --mb-soft-line: #e9eef5;
+  --mb-green: #069e62;
+  --mb-green-dark: #087950;
+  --mb-green-soft: #e8f7f1;
+  --mb-blue: #1769e8;
+  --mb-orange: #ee7900;
+  --mb-red: #ef3340;
+  --mb-shadow: 0 1px 3px rgba(20, 45, 80, .045);
+  --el-color-primary: #087950;
+  --el-border-radius-base: 6px;
+  --el-font-size-base: 13px;
+}
+
+* { box-sizing: border-box; }
+html, body, #app { margin: 0; width: 100%; min-width: 1180px; min-height: 100vh; background: var(--mb-bg); }
+button, input { font: inherit; }
