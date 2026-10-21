@@ -86,21 +86,3 @@ METERBILL_BOOTSTRAP_PASSWORD=请替换为至少12位的强密码
 docker compose -p meterbill --env-file deploy/.env -f deploy/compose.yaml stop
 ```
 
-## 验证方式
-
-项目不以“接口返回 200”作为完成依据，而是组合验证：
-
-- JUnit/MockMvc 验证状态机、权限和业务规则；
-- Testcontainers 使用真实 MySQL、RabbitMQ、Redis 验证事务、重复投递和故障恢复；
-- JMeter 记录吞吐、P95/P99、错误率和积压，并在压测后核对计量及账务不变量；
-- Prometheus 验证 HTTP、JVM、连接池、Outbox、MQ、计量、出账和对账指标；
-- 部署验收实际执行备份恢复及单应用实例终止后的 Nginx 流量切换。
-
-## 项目边界
-
-- 支付渠道为模拟实现，不处理真实资金。
-- 当前双实例运行在单台 Docker 主机上，只验证应用进程故障切换；MySQL、Redis、RabbitMQ 和宿主机仍是单点。
-- V1 使用模块化单体，不宣称已经完成微服务化或跨区域容灾。
-- Apifox 自动化资产未纳入当前仓库；接口契约以 Springdoc OpenAPI 和自动化测试为准。
-- `.env`、密钥、数据库数据和本地备份均不应提交到 Git。
-
