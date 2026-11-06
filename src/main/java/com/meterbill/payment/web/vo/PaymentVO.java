@@ -5,6 +5,7 @@ import java.time.Instant;
 public record PaymentVO(
         Long id,
         Long tenantId,
+        Long accountId,
         Long invoiceId,
         String externalReference,
         String currency,

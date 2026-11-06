@@ -21,6 +21,7 @@
         <mybatis-plus.version>3.5.17</mybatis-plus.version>
         <springdoc.version>3.1.1</springdoc.version>
         <redisson.version>4.6.1</redisson.version>
+        <meterbill.build.profile>dev</meterbill.build.profile>
     </properties>
 
     <dependencies>
@@ -161,7 +162,50 @@
                         </exclude>
                     </excludes>
                 </configuration>
+                <executions>
+                    <execution>
+                        <id>build-info</id>
+                        <goals>
+                            <goal>build-info</goal>
+                        </goals>
+                        <configuration>
+                            <additionalProperties>
+                                <buildProfile>${meterbill.build.profile}</buildProfile>
+                            </additionalProperties>
+                        </configuration>
+                    </execution>
+                </executions>
             </plugin>
         </plugins>
     </build>
+
+    <profiles>
+        <profile>
+            <id>dev</id>
+            <activation>
+                <activeByDefault>true</activeByDefault>
+            </activation>
+            <properties>
+                <meterbill.build.profile>dev</meterbill.build.profile>
+            </properties>
+        </profile>
+        <profile>
+            <id>test</id>
+            <properties>
+                <meterbill.build.profile>test</meterbill.build.profile>
+            </properties>
+        </profile>
+        <profile>
+            <id>prod</id>
+            <properties>
+                <meterbill.build.profile>prod</meterbill.build.profile>
+            </properties>
+        </profile>
+        <profile>
+            <id>release</id>
+            <properties>
+                <meterbill.build.profile>release</meterbill.build.profile>
+            </properties>
+        </profile>
+    </profiles>
 </project>

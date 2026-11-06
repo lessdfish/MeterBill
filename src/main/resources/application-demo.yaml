@@ -1,0 +1,22 @@
+spring:
+  datasource:
+    url: jdbc:mysql://${MYSQL_HOST:127.0.0.1}:${MYSQL_HOST_PORT:13306}/${MYSQL_DATABASE:meterbill_demo}?connectionTimeZone=UTC&forceConnectionTimeZoneToSession=true
+  flyway:
+    locations: classpath:db/migration,classpath:db/demo
+
+logging:
+  level:
+    root: INFO
+    com.meterbill: INFO
+
+meterbill:
+  auth:
+    jwt-secret-base64: ${METERBILL_JWT_SECRET_BASE64:MDEyMzQ1Njc4OWFiY2RlZjAxMjM0NTY3ODlhYmNkZWY=}
+  bootstrap:
+    enabled: true
+    email: ${METERBILL_BOOTSTRAP_EMAIL:admin@yunzhi.demo}
+    password: ${METERBILL_BOOTSTRAP_PASSWORD:MeterBill-Demo-2026!}
+    tenant-code: YUNZHI_AI
+    tenant-name: 云智 AI 开放平台
+  demo-data:
+    enabled: true

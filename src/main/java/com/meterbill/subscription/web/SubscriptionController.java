@@ -9,6 +9,7 @@ import com.meterbill.subscription.service.SubscriptionService;
 import com.meterbill.subscription.web.dto.CreateSubscriptionRequest;
 import com.meterbill.subscription.web.dto.SchedulePlanChangeRequest;
 import com.meterbill.subscription.web.vo.SubscriptionVO;
+import com.meterbill.subscription.web.vo.SubscriptionEventVO;
 import io.swagger.v3.oas.annotations.Operation;
 import io.swagger.v3.oas.annotations.tags.Tag;
 import jakarta.validation.Valid;
@@ -32,13 +33,20 @@ public class SubscriptionController {
             @Valid @RequestBody CreateSubscriptionRequest request) {
         requireManage(jwt);
         return ApiResponse.success(subscriptions.create(
-                TenantContext.requiredTenantId(), idempotencyKey, request.planId()));
+                TenantContext.requiredTenantId(), idempotencyKey, request.accountId(), request.planId()));
     }
 
     @Operation(summary = "查询订阅详情")
     @GetMapping("/{subscriptionId}")
     public ApiResponse<SubscriptionVO> get(@PathVariable Long subscriptionId) {
         return ApiResponse.success(subscriptions.get(
+                TenantContext.requiredTenantId(), subscriptionId));
+    }
+
+    @Operation(summary = "查询订阅生效时间线")
+    @GetMapping("/{subscriptionId}/timeline")
+    public ApiResponse<java.util.List<SubscriptionEventVO>> timeline(@PathVariable Long subscriptionId) {
+        return ApiResponse.success(subscriptions.timeline(
                 TenantContext.requiredTenantId(), subscriptionId));
     }
 

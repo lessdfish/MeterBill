@@ -1,4 +1,6 @@
 meterbill:
+  observability:
+    metrics-refresh-enabled: false
   messaging:
     enabled: false
   jobs:

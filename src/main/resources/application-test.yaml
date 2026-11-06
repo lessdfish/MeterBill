@@ -1,0 +1,10 @@
+logging:
+  level:
+    root: INFO
+    com.meterbill: INFO
+
+meterbill:
+  bootstrap:
+    enabled: false
+  demo-data:
+    enabled: false

@@ -1,0 +1,19 @@
+logging:
+  level:
+    root: INFO
+    com.meterbill: DEBUG
+
+management:
+  endpoints:
+    web:
+      exposure:
+        include: health,info,prometheus
+
+meterbill:
+  auth:
+    jwt-secret-base64: ${METERBILL_JWT_SECRET_BASE64:MDEyMzQ1Njc4OWFiY2RlZjAxMjM0NTY3ODlhYmNkZWY=}
+  bootstrap:
+    enabled: ${METERBILL_BOOTSTRAP_ENABLED:false}
+    tenant-name: ${METERBILL_BOOTSTRAP_TENANT_NAME:Local Development}
+  demo-data:
+    enabled: false

@@ -37,13 +37,16 @@ build/
 .env
 .env.*
 !.env.example
-/deploy/.env
-/deploy/backups/
+/deploy/
 
 ### Internal Documentation ###
-/docs/
+/docs/*
+!/docs/images/
+!/docs/images/*.png
 /frontend/design-qa.md
 /frontend/qa-*.png
+/.ai/
+/tmp/
 
 ### Logs ###
 /logs/

@@ -53,8 +53,19 @@ public class InvoiceAccountingService {
         for (Long payment : payments) {
             paid = add(paid, payment);
         }
-        String status = obligation <= 0 || paid >= obligation ? "PAID"
-                : paid > 0 ? "PARTIALLY_PAID" : "ISSUED";
+        var refunds = jdbc.query("""
+                SELECT r.amount_minor FROM mb_refund r
+                JOIN mb_payment p ON p.id = r.payment_id
+                WHERE p.tenant_id = ? AND p.invoice_id = ? AND r.status = 'SUCCEEDED'
+                ORDER BY r.id FOR UPDATE
+                """, (rs, row) -> rs.getLong(1), tenantId, invoiceId);
+        long refunded = 0;
+        for (Long refund : refunds) {
+            refunded = add(refunded, refund);
+        }
+        long netPaid = subtract(paid, refunded);
+        String status = obligation <= 0 || netPaid >= obligation ? "PAID"
+                : netPaid > 0 ? "PARTIALLY_PAID" : "ISSUED";
         jdbc.update("UPDATE mb_invoice SET status = ? WHERE tenant_id = ? AND id = ?",
                 status, tenantId, invoiceId);
     }
@@ -77,6 +88,14 @@ public class InvoiceAccountingService {
     private long add(long first, long second) {
         try {
             return Math.addExact(first, second);
+        } catch (ArithmeticException ex) {
+            throw new BusinessException(ErrorCode.BUSINESS_CONFLICT, "账单金额超出 BIGINT 范围");
+        }
+    }
+
+    private long subtract(long first, long second) {
+        try {
+            return Math.subtractExact(first, second);
         } catch (ArithmeticException ex) {
             throw new BusinessException(ErrorCode.BUSINESS_CONFLICT, "账单金额超出 BIGINT 范围");
         }

@@ -14,16 +14,19 @@ import org.springframework.boot.autoconfigure.condition.ConditionalOnProperty;
 import org.springframework.context.annotation.Bean;
 import org.springframework.context.annotation.Configuration;
 import org.springframework.context.annotation.Profile;
+import org.springframework.core.annotation.Order;
 import org.springframework.security.crypto.password.PasswordEncoder;
+import org.springframework.jdbc.core.JdbcTemplate;
 import org.springframework.transaction.support.TransactionTemplate;
 
 import java.util.Locale;
 
 @Configuration
-@Profile("local")
+@Profile({"local", "demo", "perf"})
 public class LocalBootstrapConfig {
 
     @Bean
+    @Order(0)
     @ConditionalOnProperty(
             prefix = "meterbill.bootstrap",
             name = "enabled",
@@ -34,11 +37,13 @@ public class LocalBootstrapConfig {
             UserMapper userMapper,
             TenantMemberMapper memberMapper,
             PasswordEncoder encoder,
+            JdbcTemplate jdbc,
             TransactionTemplate transaction,
             TenantRoleSetup roleSetup,
             @Value("${meterbill.bootstrap.email}") String email,
             @Value("${meterbill.bootstrap.password}") String password,
-            @Value("${meterbill.bootstrap.tenant-code}") String tenantCode) {
+            @Value("${meterbill.bootstrap.tenant-code}") String tenantCode,
+            @Value("${meterbill.bootstrap.tenant-name:ACME Demo}") String tenantName) {
 
         return args -> {
 
@@ -54,47 +59,29 @@ public class LocalBootstrapConfig {
 
             transaction.executeWithoutResult(status -> {
 
+                jdbc.update("""
+                        INSERT IGNORE INTO mb_tenant(tenant_code, name, status)
+                        VALUES (?, ?, 'ACTIVE')
+                        """, tenantCode, tenantName);
                 Tenant tenant = tenantMapper.selectOne(
                         new LambdaQueryWrapper<Tenant>()
                                 .eq(Tenant::getTenantCode, tenantCode)
                 );
 
 
-                if (tenant == null) {
-
-                    tenant = new Tenant();
-                    tenant.setTenantCode(tenantCode);
-                    tenant.setName("ACME Demo");
-                    tenant.setStatus("ACTIVE");
-
-                    tenantMapper.insert(tenant);
-                }
-
-
                 String normalizedEmail =
                         email.trim().toLowerCase(Locale.ROOT);
 
 
+                jdbc.update("""
+                        INSERT IGNORE INTO mb_user(email, password_hash, display_name, status)
+                        VALUES (?, ?, 'Local Administrator', 'ACTIVE')
+                        """, normalizedEmail, encoder.encode(password));
                 User user = userMapper.selectOne(
                         new LambdaQueryWrapper<User>()
                                 .eq(User::getEmail, normalizedEmail)
                 );
-
-
-                if (user == null) {
-
-                    user = new User();
-
-                    user.setEmail(normalizedEmail);
-                    user.setDisplayName("Local Administrator");
-                    user.setPasswordHash(
-                            encoder.encode(password)
-                    );
-                    user.setStatus("ACTIVE");
-
-                    userMapper.insert(user);
-
-                } else if (!encoder.matches(
+                if (!encoder.matches(
                         password,
                         user.getPasswordHash())) {
 
@@ -104,6 +91,10 @@ public class LocalBootstrapConfig {
                 }
 
 
+                jdbc.update("""
+                        INSERT IGNORE INTO mb_tenant_member(tenant_id, user_id, status)
+                        VALUES (?, ?, 'ACTIVE')
+                        """, tenant.getId(), user.getId());
                 TenantMember member = memberMapper.selectOne(
                         new LambdaQueryWrapper<TenantMember>()
                                 .eq(
@@ -115,26 +106,6 @@ public class LocalBootstrapConfig {
                                         user.getId()
                                 )
                 );
-
-
-                if (member == null) {
-
-                    member = new TenantMember();
-
-                    member.setTenantId(
-                            tenant.getId()
-                    );
-
-                    member.setUserId(
-                            user.getId()
-                    );
-
-                    member.setStatus(
-                            "ACTIVE"
-                    );
-
-                    memberMapper.insert(member);
-                }
 
 
                 /*

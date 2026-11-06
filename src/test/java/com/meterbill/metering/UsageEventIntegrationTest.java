@@ -39,6 +39,7 @@ import static org.springframework.test.web.servlet.result.MockMvcResultMatchers.
 
 @Testcontainers
 @SpringBootTest
+@org.springframework.test.annotation.DirtiesContext(classMode = org.springframework.test.annotation.DirtiesContext.ClassMode.AFTER_CLASS)
 @AutoConfigureMockMvc
 @ActiveProfiles("test")
 class UsageEventIntegrationTest {
@@ -192,6 +193,12 @@ class UsageEventIntegrationTest {
         jdbc.update("INSERT INTO mb_tenant(tenant_code, name) VALUES (?, ?)",
                 "metering-" + suffix, "Metering Test");
         Long tenantId = jdbc.queryForObject("SELECT LAST_INSERT_ID()", Long.class);
+        jdbc.update("""
+                INSERT INTO mb_customer_account
+                    (tenant_id, external_key, name, currency, time_zone_id, is_default)
+                VALUES (?, ?, 'Metering Account', 'CNY', 'UTC', TRUE)
+                """, tenantId, "metering-account-" + suffix);
+        Long accountId = jdbc.queryForObject("SELECT LAST_INSERT_ID()", Long.class);
         jdbc.update("INSERT INTO mb_tenant_member(tenant_id, user_id) VALUES (?, ?)", tenantId, userId);
         Long memberId = jdbc.queryForObject("SELECT LAST_INSERT_ID()", Long.class);
         String prefix = rawKey.substring(4, 20);
@@ -235,9 +242,10 @@ class UsageEventIntegrationTest {
 
         String idem = "metering-" + suffix;
         jdbc.update("""
-                INSERT INTO mb_subscription(tenant_id, plan_id, idempotency_key, request_hash, status)
-                VALUES (?, ?, ?, ?, 'ACTIVE')
-                """, tenantId, planId, idem, "0".repeat(64));
+                INSERT INTO mb_subscription
+                    (tenant_id, account_id, plan_id, idempotency_key, request_hash, status)
+                VALUES (?, ?, ?, ?, ?, 'ACTIVE')
+                """, tenantId, accountId, planId, idem, "0".repeat(64));
         Long subscriptionId = jdbc.queryForObject("SELECT LAST_INSERT_ID()", Long.class);
         Instant now = Instant.now();
         jdbc.update("""
@@ -273,7 +281,7 @@ class UsageEventIntegrationTest {
 
     private long totalQuantity(Fixture value) {
         Long total = jdbc.queryForObject("""
-                SELECT total_quantity FROM mb_usage_period_total
+                SELECT SUM(total_quantity) FROM mb_usage_period_total
                 WHERE tenant_id = ? AND subscription_id = ? AND period_id = ? AND meter_id = ?
                 """, Long.class, value.tenantId(), value.subscriptionId(),
                 value.periodId(), value.meterId());

@@ -174,13 +174,19 @@ public class ReconciliationService {
                            AS ledger_ar_minor,
                        COALESCE((SELECT SUM(p.amount_minor) FROM mb_payment p
                                  WHERE p.tenant_id = i.tenant_id AND p.invoice_id = i.id
-                                   AND p.status = 'SUCCEEDED'), 0) AS paid_minor
+                                   AND p.status = 'SUCCEEDED'), 0)
+                       - COALESCE((SELECT SUM(r.amount_minor)
+                                   FROM mb_refund r
+                                   JOIN mb_payment p ON p.id = r.payment_id
+                                  WHERE p.tenant_id = i.tenant_id AND p.invoice_id = i.id
+                                    AND r.tenant_id = i.tenant_id
+                                    AND r.status = 'SUCCEEDED'), 0) AS net_paid_minor
                 FROM mb_invoice i
                 WHERE i.tenant_id = ? AND i.status <> 'VOIDED'
                 ORDER BY i.id
                 """, (rs, row) -> new InvoiceCheck(rs.getLong("id"), rs.getString("currency"),
                 rs.getLong("total_amount_minor"), rs.getLong("adjustment_total_minor"),
-                rs.getLong("ledger_ar_minor"), rs.getLong("paid_minor"), rs.getString("status")), tenantId);
+                rs.getLong("ledger_ar_minor"), rs.getLong("net_paid_minor"), rs.getString("status")), tenantId);
         for (InvoiceCheck invoice : invoices) {
             long obligation = addExact(invoice.totalMinor(), invoice.adjustmentMinor());
             if (obligation != invoice.ledgerArMinor()) {
@@ -190,13 +196,13 @@ public class ReconciliationService {
                         invoice.ledgerArMinor(), null, null,
                         "Invoice obligation is compared with posted AR for the invoice and its active adjustments.");
             }
-            String expectedStatus = invoiceStatus(obligation, invoice.paidMinor());
+            String expectedStatus = invoiceStatus(obligation, invoice.netPaidMinor());
             if (!expectedStatus.equals(invoice.status())) {
                 recordDifference(tenantId, runId,
                         "INVOICE_PAYMENT_STATUS_MISMATCH:" + invoice.id(),
                         "INVOICE_PAYMENT_STATUS_MISMATCH", "INVOICE", invoice.id().toString(),
-                        invoice.currency(), obligation, invoice.paidMinor(), expectedStatus,
-                        invoice.status(), "Expected status is derived from successful payments and invoice obligation.");
+                        invoice.currency(), obligation, invoice.netPaidMinor(), expectedStatus,
+                        invoice.status(), "Expected status is derived from net successful payments after refunds and invoice obligation.");
             }
         }
     }
@@ -220,7 +226,7 @@ public class ReconciliationService {
                 FROM mb_ledger_transaction lt
                 JOIN mb_ledger_entry e ON e.transaction_id = lt.id
                 JOIN mb_ledger_account la ON la.id = e.account_id AND la.account_code = 'CASH'
-                WHERE lt.tenant_id = ? AND lt.business_type IN ('PAYMENT', 'REFUND', 'PAYMENT_REVERSAL')
+                WHERE lt.tenant_id = ? AND lt.business_type IN ('PAYMENT', 'REFUND', 'PAYMENT_REVOCATION')
                 GROUP BY lt.currency ORDER BY lt.currency
                 """, rs -> {
                     ledgerTotals.put(rs.getString("currency"), rs.getLong("net_minor"));
@@ -268,11 +274,11 @@ public class ReconciliationService {
                     FROM mb_ledger_transaction t JOIN mb_ledger_entry e ON e.transaction_id=t.id
                     JOIN mb_ledger_account a ON a.id=e.account_id AND a.account_code='CASH'
                     WHERE t.tenant_id=? AND t.business_id=?
-                    AND ((?='CHARGE' AND t.business_type IN ('PAYMENT','PAYMENT_REVERSAL')) OR (?='REFUND' AND t.business_type='REFUND'))
+                    AND ((?='CHARGE' AND t.business_type IN ('PAYMENT','PAYMENT_REVOCATION')) OR (?='REFUND' AND t.business_type='REFUND'))
                     """,Long.class,tenant,order.id(),order.kind(),order.kind());
             if (expected!=cash) recordDifference(tenant,run,"TRANSACTION_LEDGER_MISMATCH:"+order.kind()+":"+order.id(),
                     "TRANSACTION_LEDGER_MISMATCH",order.kind(),order.id().toString(),order.currency(),expected,cash,
-                    order.status(),null,"Per-order cash posting including reversal");
+                    order.status(),null,"Per-order cash posting including revocation");
         }
         for (var channel:byReference.values()) transactionDifference(tenant,run,"INTERNAL_ORDER_MISSING",channel,null,"Channel observation has no internal order");
     }
@@ -410,7 +416,7 @@ public class ReconciliationService {
     }
 
     private record InvoiceCheck(Long id, String currency, Long totalMinor, Long adjustmentMinor,
-                                Long ledgerArMinor, Long paidMinor, String status) {
+                                Long ledgerArMinor, Long netPaidMinor, String status) {
     }
 
     private record DifferenceStatusRow(Long tenantId, String status) {
