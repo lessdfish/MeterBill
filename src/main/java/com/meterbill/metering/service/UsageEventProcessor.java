@@ -12,6 +12,7 @@ import java.util.List;
 @RequiredArgsConstructor
 public class UsageEventProcessor {
 
+    private static final int TOTAL_SHARDS = 32;
     private final JdbcTemplate jdbc;
 
     @Transactional
@@ -39,14 +40,14 @@ public class UsageEventProcessor {
         if (firstDelivery == 1) {
             jdbc.update("""
                     INSERT INTO mb_usage_period_total
-                        (tenant_id, subscription_id, period_id, meter_id,
+                        (tenant_id, subscription_id, period_id, meter_id, shard_no,
                          total_quantity, revision)
-                    VALUES (?, ?, ?, ?, ?, 1)
+                    VALUES (?, ?, ?, ?, ?, ?, 1)
                     ON DUPLICATE KEY UPDATE
                         total_quantity = total_quantity + VALUES(total_quantity),
                         revision = revision + 1
                     """, event.tenantId(), event.subscriptionId(), event.periodId(),
-                    event.meterId(), event.quantity());
+                    event.meterId(), Math.floorMod(eventId, TOTAL_SHARDS), event.quantity());
         }
         jdbc.update("""
                 UPDATE mb_usage_event

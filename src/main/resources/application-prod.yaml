@@ -1,0 +1,23 @@
+spring:
+  rabbitmq:
+    password: ${RABBITMQ_PASSWORD}
+  data:
+    redis:
+      password: ${REDIS_PASSWORD}
+
+springdoc:
+  api-docs:
+    enabled: false
+  swagger-ui:
+    enabled: false
+
+logging:
+  level:
+    root: INFO
+    com.meterbill: INFO
+
+meterbill:
+  bootstrap:
+    enabled: false
+  demo-data:
+    enabled: false

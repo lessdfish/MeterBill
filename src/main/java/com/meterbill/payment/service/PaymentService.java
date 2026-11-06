@@ -2,6 +2,7 @@ package com.meterbill.payment.service;
 
 import com.meterbill.common.exception.BusinessException;
 import com.meterbill.common.exception.ErrorCode;
+import com.meterbill.common.event.DomainEventService;
 import com.meterbill.identity.service.SecurityAuditService;
 import com.meterbill.ledger.service.LedgerService;
 import com.meterbill.billing.service.InvoiceAccountingService;
@@ -22,6 +23,7 @@ import java.time.ZoneOffset;
 import java.util.HexFormat;
 import java.util.List;
 import java.util.UUID;
+import java.util.Map;
 
 @Service
 @RequiredArgsConstructor
@@ -31,35 +33,43 @@ public class PaymentService {
     private final LedgerService ledger;
     private final InvoiceAccountingService invoiceAccounting;
     private final SecurityAuditService audit;
+    private final PaymentTransactionService transactions;
+    private final DomainEventService events;
 
     @Transactional
-    public Long reversePayment(Long paymentId, Long actorId, String reason) {
+    public Long revokePayment(Long paymentId, Long actorId, String reason) {
         if (actorId == null || reason == null || reason.isBlank() || reason.length() > 500)
-            throw conflict("冲正必须记录操作人和原因（最多500字）");
+            throw conflict("支付撤销必须记录操作人和原因（最多500字）");
         PaymentRow lookup = requirePayment(paymentId, false);
         requireInvoice(lookup.tenantId(), lookup.invoiceId(), true);
         PaymentRow payment = requirePayment(paymentId, true);
-        var existing = jdbc.queryForList("SELECT id FROM mb_payment_reversal WHERE payment_id=? FOR UPDATE", Long.class, paymentId);
+        var existing = jdbc.queryForList("SELECT id FROM mb_payment_revocation WHERE payment_id=? FOR UPDATE", Long.class, paymentId);
         if (!existing.isEmpty()) {
-            String previous = jdbc.queryForObject("SELECT reason FROM mb_payment_reversal WHERE payment_id=? FOR UPDATE", String.class, paymentId);
-            if (!reason.trim().equals(previous)) throw conflict("该付款已以不同原因冲正");
+            String previous = jdbc.queryForObject("SELECT reason FROM mb_payment_revocation WHERE payment_id=? FOR UPDATE", String.class, paymentId);
+            if (!reason.trim().equals(previous)) throw conflict("该支付已以不同原因撤销");
             return existing.getFirst();
         }
-        if (!"SUCCEEDED".equals(payment.status())) throw conflict("仅成功付款可冲正");
-        if (sumRefunds(paymentId) != 0) throw conflict("存在待处理、未知或成功退款，不能冲正");
+        if (!"SUCCEEDED".equals(payment.status())) throw conflict("仅成功支付可撤销");
+        if (sumRefunds(paymentId) != 0) throw conflict("存在待处理、未知或成功退款，不能撤销支付");
         if (!"SUCCEEDED".equals(channelResult(payment.tenantId(), payment.externalReference(), "CHARGE", payment.currency(), payment.amountMinor())))
             throw conflict("渠道状态不一致，先核查渠道流水");
         Long original = jdbc.queryForObject("SELECT id FROM mb_ledger_transaction WHERE tenant_id=? AND business_type='PAYMENT' AND business_id=? AND posting_action='SETTLE' FOR UPDATE",
                 Long.class, payment.tenantId(), paymentId);
-        Long reversal = ledger.post(payment.tenantId(), "PAYMENT_REVERSAL", paymentId, "REVERSE", payment.currency(), reason.trim(), List.of(
+        Long revocation = ledger.post(payment.tenantId(), "PAYMENT_REVOCATION", paymentId, "REVOKE", payment.currency(), reason.trim(), List.of(
                 entry("AR", "ASSET", "DEBIT", payment.amountMinor()), entry("CASH", "ASSET", "CREDIT", payment.amountMinor())));
-        jdbc.update("INSERT INTO mb_payment_reversal(tenant_id,payment_id,original_transaction_id,reversal_transaction_id,reason,actor_id) VALUES (?,?,?,?,?,?)",
-                payment.tenantId(), paymentId, original, reversal, reason.trim(), actorId);
+        jdbc.update("INSERT INTO mb_payment_revocation(tenant_id,payment_id,original_transaction_id,revocation_transaction_id,reason,actor_id) VALUES (?,?,?,?,?,?)",
+                payment.tenantId(), paymentId, original, revocation, reason.trim(), actorId);
         Long id = jdbc.queryForObject("SELECT LAST_INSERT_ID()", Long.class);
-        jdbc.update("UPDATE mb_payment SET status='REVERSED' WHERE id=?", paymentId);
-        jdbc.update("UPDATE mb_channel_transaction SET status='REVERSED' WHERE tenant_id=? AND external_reference=?", payment.tenantId(), payment.externalReference());
+        jdbc.update("UPDATE mb_payment SET status='REVOKED' WHERE id=?", paymentId);
+        jdbc.update("UPDATE mb_channel_transaction SET status='REVOKED' WHERE tenant_id=? AND external_reference=?", payment.tenantId(), payment.externalReference());
         invoiceAccounting.synchronize(payment.tenantId(), payment.invoiceId());
-        audit.record(payment.tenantId(), actorId, "PAYMENT_REVERSE", "PAYMENT", paymentId.toString());
+        transactions.appendPayment(payment.tenantId(), payment.accountId(), payment.id(),
+                "REVOCATION", "REVOKED", payment.externalReference(), payment.currency(),
+                payment.amountMinor(), "payment:" + payment.id() + ":revoked");
+        events.append(payment.tenantId(), payment.accountId(), "PAYMENT", payment.id(), null,
+                "PAYMENT_REVOKED", "payment:" + payment.id() + ":revoked", null,
+                Map.of("invoiceId", payment.invoiceId(), "reason", reason.trim()));
+        audit.record(payment.tenantId(), actorId, "PAYMENT_REVOKE", "PAYMENT", paymentId.toString());
         return id;
     }
 
@@ -76,11 +86,12 @@ public class PaymentService {
 
     @Transactional
     public RefundVO queryRefundChannel(Long id, Long actor) {
-        RefundRow refund = requireRefund(id, true);
+        LockedRefund locked = lockRefundForResult(id);
+        RefundRow refund = locked.refund();
         String result = channelResult(refund.tenantId(), refund.externalReference(), "REFUND", refund.currency(), refund.amountMinor());
         audit.record(refund.tenantId(), actor, "REFUND_CHANNEL_QUERY", "REFUND", id.toString());
         if (result == null || "PENDING".equals(result) || result.equals(refund.status())) return getRefund(refund.tenantId(), id);
-        return simulateRefundResult(id, actor, result);
+        return applyRefundResult(refund, locked.invoiceId(), actor, result);
     }
 
     private String channelResult(Long tenant, String reference, String type, String currency, long amount) {
@@ -130,10 +141,10 @@ public class PaymentService {
         try {
             jdbc.update("""
                     INSERT INTO mb_payment
-                        (tenant_id, invoice_id, idempotency_key, request_hash,
+                        (tenant_id, account_id, invoice_id, idempotency_key, request_hash,
                          external_reference, currency, amount_minor, status)
-                    VALUES (?, ?, ?, ?, ?, ?, ?, 'PENDING')
-                    """, tenantId, invoiceId, idempotencyKey, requestHash,
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'PENDING')
+                    """, tenantId, invoice.accountId(), invoiceId, idempotencyKey, requestHash,
                     externalReference, invoice.currency(), amountMinor);
             paymentId = jdbc.queryForObject("SELECT LAST_INSERT_ID()", Long.class);
         } catch (DuplicateKeyException ex) {
@@ -150,6 +161,11 @@ public class PaymentService {
                      transaction_type, currency, amount_minor, status)
                 VALUES (?, ?, 'SIMULATED', ?, 'CHARGE', ?, ?, 'PENDING')
                 """, tenantId, paymentId, externalReference, invoice.currency(), amountMinor);
+        transactions.appendPayment(tenantId, invoice.accountId(), paymentId, "PURCHASE", "PENDING",
+                externalReference, invoice.currency(), amountMinor, "payment:" + paymentId + ":pending");
+        events.append(tenantId, invoice.accountId(), "PAYMENT", paymentId, 0L,
+                "PAYMENT_CREATED", "payment:" + paymentId + ":created", idempotencyKey,
+                Map.of("invoiceId", invoiceId, "amountMinor", amountMinor, "currency", invoice.currency()));
         audit.record(tenantId, actorId, "PAYMENT_CREATE", "PAYMENT", paymentId.toString());
         return getPayment(tenantId, paymentId);
     }
@@ -178,6 +194,12 @@ public class PaymentService {
                 UPDATE mb_channel_transaction SET status = ?, updated_at = UTC_TIMESTAMP(6)
                 WHERE payment_id = ? AND transaction_type = 'CHARGE'
                 """, result, paymentId);
+        transactions.appendPayment(payment.tenantId(), payment.accountId(), payment.id(),
+                "PURCHASE", result, payment.externalReference(), payment.currency(),
+                payment.amountMinor(), "payment:" + payment.id() + ":" + result.toLowerCase());
+        events.append(payment.tenantId(), payment.accountId(), "PAYMENT", payment.id(), null,
+                "PAYMENT_" + result, "payment:" + payment.id() + ":" + result.toLowerCase(), null,
+                Map.of("invoiceId", payment.invoiceId(), "amountMinor", payment.amountMinor()));
 
         if ("SUCCEEDED".equals(result)) {
             ledger.post(payment.tenantId(), "PAYMENT", payment.id(), "SETTLE",
@@ -194,11 +216,11 @@ public class PaymentService {
     @Transactional(readOnly = true)
     public PaymentVO getPayment(Long tenantId, Long paymentId) {
         List<PaymentVO> rows = jdbc.query("""
-                SELECT id, tenant_id, invoice_id, external_reference, currency,
+                SELECT id, tenant_id, account_id, invoice_id, external_reference, currency,
                        amount_minor, status, created_at, completed_at
                 FROM mb_payment WHERE tenant_id = ? AND id = ?
                 """, (rs, row) -> new PaymentVO(
-                rs.getLong("id"), rs.getLong("tenant_id"), rs.getLong("invoice_id"),
+                rs.getLong("id"), rs.getLong("tenant_id"), rs.getLong("account_id"), rs.getLong("invoice_id"),
                 rs.getString("external_reference"), rs.getString("currency"),
                 rs.getLong("amount_minor"), rs.getString("status"),
                 instant(rs.getObject("created_at", LocalDateTime.class)),
@@ -241,10 +263,10 @@ public class PaymentService {
         try {
             jdbc.update("""
                     INSERT INTO mb_refund
-                        (tenant_id, payment_id, idempotency_key, request_hash,
+                        (tenant_id, account_id, payment_id, idempotency_key, request_hash,
                          external_reference, currency, amount_minor, status)
-                    VALUES (?, ?, ?, ?, ?, ?, ?, 'PENDING')
-                    """, tenantId, paymentId, idempotencyKey, requestHash,
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'PENDING')
+                    """, tenantId, payment.accountId(), paymentId, idempotencyKey, requestHash,
                     externalReference, payment.currency(), amountMinor);
             refundId = jdbc.queryForObject("SELECT LAST_INSERT_ID()", Long.class);
         } catch (DuplicateKeyException ex) {
@@ -261,6 +283,11 @@ public class PaymentService {
                      transaction_type, currency, amount_minor, status)
                 VALUES (?, ?, 'SIMULATED', ?, 'REFUND', ?, ?, 'PENDING')
                 """, tenantId, refundId, externalReference, payment.currency(), amountMinor);
+        transactions.appendRefund(tenantId, payment.accountId(), refundId, "PENDING",
+                externalReference, payment.currency(), amountMinor, "refund:" + refundId + ":pending");
+        events.append(tenantId, payment.accountId(), "REFUND", refundId, 0L,
+                "REFUND_CREATED", "refund:" + refundId + ":created", idempotencyKey,
+                Map.of("paymentId", paymentId, "amountMinor", amountMinor, "currency", payment.currency()));
         audit.record(tenantId, actorId, "REFUND_CREATE", "REFUND", refundId.toString());
         return getRefund(tenantId, refundId);
     }
@@ -268,7 +295,20 @@ public class PaymentService {
     @Transactional
     public RefundVO simulateRefundResult(Long refundId, Long actorId, String result) {
         validateResult(result);
+        LockedRefund locked = lockRefundForResult(refundId);
+        return applyRefundResult(locked.refund(), locked.invoiceId(), actorId, result);
+    }
+
+    private LockedRefund lockRefundForResult(Long refundId) {
+        RefundRow lookup = requireRefund(refundId, false);
+        PaymentRow paymentLookup = requirePayment(lookup.tenantId(), lookup.paymentId(), false);
+        requireInvoice(lookup.tenantId(), paymentLookup.invoiceId(), true);
+        PaymentRow payment = requirePayment(lookup.tenantId(), lookup.paymentId(), true);
         RefundRow refund = requireRefund(refundId, true);
+        return new LockedRefund(refund, payment.invoiceId());
+    }
+
+    private RefundVO applyRefundResult(RefundRow refund, Long invoiceId, Long actorId, String result) {
         if (result.equals(refund.status())) {
             return getRefund(refund.tenantId(), refund.id());
         }
@@ -282,17 +322,24 @@ public class PaymentService {
                 UPDATE mb_refund SET status = ?,
                     completed_at = CASE WHEN ? THEN UTC_TIMESTAMP(6) ELSE NULL END
                 WHERE id = ? AND status IN ('PENDING', 'UNKNOWN')
-                """, result, completed, refundId);
+                """, result, completed, refund.id());
         jdbc.update("""
                 UPDATE mb_channel_transaction SET status = ?, updated_at = UTC_TIMESTAMP(6)
                 WHERE refund_id = ? AND transaction_type = 'REFUND'
-                """, result, refundId);
+                """, result, refund.id());
+        transactions.appendRefund(refund.tenantId(), refund.accountId(), refund.id(), result,
+                refund.externalReference(), refund.currency(), refund.amountMinor(),
+                "refund:" + refund.id() + ":" + result.toLowerCase());
+        events.append(refund.tenantId(), refund.accountId(), "REFUND", refund.id(), null,
+                "REFUND_" + result, "refund:" + refund.id() + ":" + result.toLowerCase(), null,
+                Map.of("paymentId", refund.paymentId(), "amountMinor", refund.amountMinor()));
 
         if ("SUCCEEDED".equals(result)) {
             ledger.post(refund.tenantId(), "REFUND", refund.id(), "SETTLE",
                     refund.currency(), "Simulated refund settlement", List.of(
-                            entry("REVENUE", "REVENUE", "DEBIT", refund.amountMinor()),
+                            entry("AR", "ASSET", "DEBIT", refund.amountMinor()),
                             entry("CASH", "ASSET", "CREDIT", refund.amountMinor())));
+            invoiceAccounting.synchronize(refund.tenantId(), invoiceId);
         }
         audit.record(refund.tenantId(), actorId, "REFUND_RESULT_" + result,
                 "REFUND", refund.id().toString());
@@ -302,11 +349,11 @@ public class PaymentService {
     @Transactional(readOnly = true)
     public RefundVO getRefund(Long tenantId, Long refundId) {
         List<RefundVO> rows = jdbc.query("""
-                SELECT id, tenant_id, payment_id, external_reference, currency,
+                SELECT id, tenant_id, account_id, payment_id, external_reference, currency,
                        amount_minor, status, created_at, completed_at
                 FROM mb_refund WHERE tenant_id = ? AND id = ?
                 """, (rs, row) -> new RefundVO(
-                rs.getLong("id"), rs.getLong("tenant_id"), rs.getLong("payment_id"),
+                rs.getLong("id"), rs.getLong("tenant_id"), rs.getLong("account_id"), rs.getLong("payment_id"),
                 rs.getString("external_reference"), rs.getString("currency"),
                 rs.getLong("amount_minor"), rs.getString("status"),
                 instant(rs.getObject("created_at", LocalDateTime.class)),
@@ -319,17 +366,17 @@ public class PaymentService {
 
     private void requireCompatibleChannel(Long tenant,String reference,String kind,String currency,long amount,String result) {
         String observed=channelResult(tenant,reference,kind,currency,amount);
-        if (observed!=null && List.of("SUCCEEDED","FAILED","REVERSED").contains(observed) && !observed.equals(result))
+        if (observed!=null && List.of("SUCCEEDED","FAILED","REVOKED").contains(observed) && !observed.equals(result))
             throw conflict("回调与渠道终态不一致，不能覆盖已确认事实");
     }
 
     private InvoiceHeader requireInvoice(Long tenantId, Long invoiceId, boolean lock) {
         String sql = """
-                SELECT id, tenant_id, currency, total_amount_minor, status
+                SELECT id, tenant_id, account_id, currency, total_amount_minor, status
                 FROM mb_invoice WHERE tenant_id = ? AND id = ?
                 """ + (lock ? " FOR UPDATE" : "");
         List<InvoiceHeader> rows = jdbc.query(sql, (rs, row) -> new InvoiceHeader(
-                rs.getLong("id"), rs.getLong("tenant_id"), rs.getString("currency"),
+                rs.getLong("id"), rs.getLong("tenant_id"), rs.getLong("account_id"), rs.getString("currency"),
                 rs.getLong("total_amount_minor"), rs.getString("status")), tenantId, invoiceId);
         if (rows.isEmpty()) {
             throw new BusinessException(ErrorCode.RESOURCE_NOT_FOUND, "账单不存在");
@@ -339,7 +386,7 @@ public class PaymentService {
 
     private PaymentRow requirePayment(Long tenantId, Long paymentId, boolean lock) {
         String sql = """
-                SELECT id, tenant_id, invoice_id, request_hash, external_reference,
+                SELECT id, tenant_id, account_id, invoice_id, request_hash, external_reference,
                        currency, amount_minor, status
                 FROM mb_payment WHERE tenant_id = ? AND id = ?
                 """ + (lock ? " FOR UPDATE" : "");
@@ -352,7 +399,7 @@ public class PaymentService {
 
     private PaymentRow requirePayment(Long paymentId, boolean lock) {
         String sql = """
-                SELECT id, tenant_id, invoice_id, request_hash, external_reference,
+                SELECT id, tenant_id, account_id, invoice_id, request_hash, external_reference,
                        currency, amount_minor, status
                 FROM mb_payment WHERE id = ?
                 """ + (lock ? " FOR UPDATE" : "");
@@ -364,7 +411,7 @@ public class PaymentService {
     }
 
     private PaymentRow paymentRow(java.sql.ResultSet rs) throws java.sql.SQLException {
-        return new PaymentRow(rs.getLong("id"), rs.getLong("tenant_id"),
+        return new PaymentRow(rs.getLong("id"), rs.getLong("tenant_id"), rs.getLong("account_id"),
                 rs.getLong("invoice_id"), rs.getString("request_hash"),
                 rs.getString("external_reference"), rs.getString("currency"),
                 rs.getLong("amount_minor"), rs.getString("status"));
@@ -372,12 +419,12 @@ public class PaymentService {
 
     private RefundRow requireRefund(Long refundId, boolean lock) {
         String sql = """
-                SELECT id, tenant_id, payment_id, request_hash, external_reference,
+                SELECT id, tenant_id, account_id, payment_id, request_hash, external_reference,
                        currency, amount_minor, status
                 FROM mb_refund WHERE id = ?
                 """ + (lock ? " FOR UPDATE" : "");
         List<RefundRow> rows = jdbc.query(sql, (rs, row) -> new RefundRow(
-                rs.getLong("id"), rs.getLong("tenant_id"), rs.getLong("payment_id"),
+                rs.getLong("id"), rs.getLong("tenant_id"), rs.getLong("account_id"), rs.getLong("payment_id"),
                 rs.getString("request_hash"), rs.getString("external_reference"),
                 rs.getString("currency"), rs.getLong("amount_minor"), rs.getString("status")), refundId);
         if (rows.isEmpty()) {
@@ -388,7 +435,7 @@ public class PaymentService {
 
     private PaymentRow findPaymentByIdempotency(Long tenantId, String key) {
         List<PaymentRow> rows = jdbc.query("""
-                SELECT id, tenant_id, invoice_id, request_hash, external_reference,
+                SELECT id, tenant_id, account_id, invoice_id, request_hash, external_reference,
                        currency, amount_minor, status
                 FROM mb_payment WHERE tenant_id = ? AND idempotency_key = ?
                 """, (rs, row) -> paymentRow(rs), tenantId, key);
@@ -397,7 +444,7 @@ public class PaymentService {
 
     private PaymentRow findPaymentByIdempotencyCurrent(Long tenantId, String key) {
         List<PaymentRow> rows = jdbc.query("""
-                SELECT id, tenant_id, invoice_id, request_hash, external_reference,
+                SELECT id, tenant_id, account_id, invoice_id, request_hash, external_reference,
                        currency, amount_minor, status
                 FROM mb_payment WHERE tenant_id = ? AND idempotency_key = ? FOR UPDATE
                 """, (rs, row) -> paymentRow(rs), tenantId, key);
@@ -406,11 +453,11 @@ public class PaymentService {
 
     private RefundRow findRefundByIdempotency(Long tenantId, String key) {
         List<RefundRow> rows = jdbc.query("""
-                SELECT id, tenant_id, payment_id, request_hash, external_reference,
+                SELECT id, tenant_id, account_id, payment_id, request_hash, external_reference,
                        currency, amount_minor, status
                 FROM mb_refund WHERE tenant_id = ? AND idempotency_key = ?
                 """, (rs, row) -> new RefundRow(
-                rs.getLong("id"), rs.getLong("tenant_id"), rs.getLong("payment_id"),
+                rs.getLong("id"), rs.getLong("tenant_id"), rs.getLong("account_id"), rs.getLong("payment_id"),
                 rs.getString("request_hash"), rs.getString("external_reference"),
                 rs.getString("currency"), rs.getLong("amount_minor"), rs.getString("status")),
                 tenantId, key);
@@ -419,11 +466,11 @@ public class PaymentService {
 
     private RefundRow findRefundByIdempotencyCurrent(Long tenantId, String key) {
         List<RefundRow> rows = jdbc.query("""
-                SELECT id, tenant_id, payment_id, request_hash, external_reference,
+                SELECT id, tenant_id, account_id, payment_id, request_hash, external_reference,
                        currency, amount_minor, status
                 FROM mb_refund WHERE tenant_id = ? AND idempotency_key = ? FOR UPDATE
                 """, (rs, row) -> new RefundRow(
-                rs.getLong("id"), rs.getLong("tenant_id"), rs.getLong("payment_id"),
+                rs.getLong("id"), rs.getLong("tenant_id"), rs.getLong("account_id"), rs.getLong("payment_id"),
                 rs.getString("request_hash"), rs.getString("external_reference"),
                 rs.getString("currency"), rs.getLong("amount_minor"), rs.getString("status")),
                 tenantId, key);
@@ -526,18 +573,21 @@ public class PaymentService {
         return new BusinessException(ErrorCode.BUSINESS_CONFLICT, message);
     }
 
-    private record InvoiceHeader(Long id, Long tenantId, String currency,
+    private record InvoiceHeader(Long id, Long tenantId, Long accountId, String currency,
                                  Long totalAmountMinor, String status) {
     }
 
-    private record PaymentRow(Long id, Long tenantId, Long invoiceId, String requestHash,
+    private record PaymentRow(Long id, Long tenantId, Long accountId, Long invoiceId, String requestHash,
                               String externalReference, String currency,
                               Long amountMinor, String status) {
     }
 
-    private record RefundRow(Long id, Long tenantId, Long paymentId, String requestHash,
+    private record RefundRow(Long id, Long tenantId, Long accountId, Long paymentId, String requestHash,
                              String externalReference, String currency,
                              Long amountMinor, String status) {
+    }
+
+    private record LockedRefund(RefundRow refund, Long invoiceId) {
     }
 
 

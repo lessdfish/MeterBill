@@ -2,9 +2,12 @@ package com.meterbill.subscription.service;
 
 import com.meterbill.common.exception.BusinessException;
 import com.meterbill.common.exception.ErrorCode;
+import com.meterbill.common.event.DomainEventService;
+import com.meterbill.account.api.AccountQueryApi;
 import com.meterbill.identity.service.SecurityAuditService;
 import com.meterbill.subscription.domain.SubscriptionStatus;
 import com.meterbill.subscription.web.vo.SubscriptionVO;
+import com.meterbill.subscription.web.vo.SubscriptionEventVO;
 import lombok.RequiredArgsConstructor;
 import org.springframework.dao.DuplicateKeyException;
 import org.springframework.jdbc.core.JdbcTemplate;
@@ -15,12 +18,14 @@ import java.nio.charset.StandardCharsets;
 import java.security.MessageDigest;
 import java.security.NoSuchAlgorithmException;
 import java.time.Instant;
+import java.time.Clock;
 import java.time.LocalDateTime;
 import java.time.YearMonth;
 import java.time.ZoneId;
 import java.time.ZoneOffset;
 import java.util.HexFormat;
 import java.util.List;
+import java.util.Map;
 
 @Service
 @RequiredArgsConstructor
@@ -28,11 +33,22 @@ public class SubscriptionService {
 
     private final JdbcTemplate jdbc;
     private final SecurityAuditService audit;
+    private final AccountQueryApi accounts;
+    private final DomainEventService events;
+    private final Clock clock;
 
     @Transactional
     public SubscriptionVO create(Long tenantId, String idempotencyKey, Long planId) {
+        return create(tenantId, idempotencyKey, null, planId);
+    }
+
+    @Transactional
+    public SubscriptionVO create(Long tenantId, String idempotencyKey, Long requestedAccountId, Long planId) {
         validateIdempotencyKey(idempotencyKey);
-        String requestHash = hash(planId.toString());
+        AccountQueryApi.AccountRef account = requestedAccountId == null
+                ? accounts.requireDefault(tenantId) : accounts.require(tenantId, requestedAccountId);
+        String requestHash = requestedAccountId == null
+                ? hash(planId.toString()) : hash(account.id() + "|" + planId);
         SubscriptionRow existing = findByIdempotencyKey(tenantId, idempotencyKey);
         if (existing != null) {
             requireSameRequest(existing.requestHash(), requestHash);
@@ -43,9 +59,9 @@ public class SubscriptionService {
         try {
             jdbc.update("""
                     INSERT INTO mb_subscription
-                        (tenant_id, plan_id, idempotency_key, request_hash, status)
-                    VALUES (?, ?, ?, ?, 'PENDING')
-                    """, tenantId, planId, idempotencyKey, requestHash);
+                        (tenant_id, account_id, plan_id, idempotency_key, request_hash, status)
+                    VALUES (?, ?, ?, ?, ?, 'PENDING')
+                    """, tenantId, account.id(), planId, idempotencyKey, requestHash);
         } catch (DuplicateKeyException ex) {
             SubscriptionRow raced = findByIdempotencyKey(tenantId, idempotencyKey);
             if (raced == null) {
@@ -56,6 +72,10 @@ public class SubscriptionService {
         }
 
         Long id = jdbc.queryForObject("SELECT LAST_INSERT_ID()", Long.class);
+        Instant now = clock.instant();
+        appendSubscriptionEvent(tenantId, account.id(), id, "create:" + idempotencyKey,
+                "CREATED", null, "PENDING", null, planId, now, now,
+                Map.of("idempotencyKey", idempotencyKey));
         audit.record(tenantId, null, "SUBSCRIPTION_CREATE", "SUBSCRIPTION", id.toString());
         return view(tenantId, id);
     }
@@ -75,9 +95,10 @@ public class SubscriptionService {
             throw conflict("当前订阅状态不能激活");
         }
 
-        PlanPrice price = requireMonthlyPrice(subscription.planId(), Instant.now());
+        PlanPrice price = requireMonthlyPrice(
+                subscription.planId(), subscription.accountCurrency(), clock.instant());
         ZoneId zone = tenantZone(tenantId);
-        Instant now = Instant.now();
+        Instant now = clock.instant();
         YearMonth currentMonth = YearMonth.from(now.atZone(zone));
         Instant periodStart = currentMonth.atDay(1).atStartOfDay(zone).toInstant();
         Instant periodEnd = currentMonth.plusMonths(1).atDay(1).atStartOfDay(zone).toInstant();
@@ -92,6 +113,9 @@ public class SubscriptionService {
         if (changed != 1) {
             throw conflict("订阅状态已变化，请刷新后重试");
         }
+        appendSubscriptionEvent(tenantId, subscription.accountId(), subscriptionId, "activate",
+                "ACTIVATED", "PENDING", "ACTIVE", subscription.planId(), subscription.planId(),
+                now, now, Map.of("periodStart", periodStart.toString(), "periodEnd", periodEnd.toString()));
         audit.record(tenantId, null, "SUBSCRIPTION_ACTIVATE", "SUBSCRIPTION", subscriptionId.toString());
         return view(tenantId, subscriptionId);
     }
@@ -107,6 +131,9 @@ public class SubscriptionService {
                 && !immediate) {
             return view(tenantId, subscriptionId);
         }
+        String previousStatus = subscription.status();
+        Instant requestedAt = clock.instant();
+        Instant effectiveAt = requestedAt;
         if (SubscriptionStatus.PENDING.name().equals(subscription.status()) && immediate) {
             updateStatus(tenantId, subscriptionId, "PENDING", "CANCELED");
         } else if (SubscriptionStatus.ACTIVE.name().equals(subscription.status())) {
@@ -118,10 +145,19 @@ public class SubscriptionService {
                         SET status = 'ENDED', period_end = UTC_TIMESTAMP(6)
                         WHERE subscription_id = ? AND tenant_id = ? AND status = 'ACTIVE'
                         """, subscriptionId, tenantId);
+            } else {
+                effectiveAt = requireActivePeriod(tenantId, subscriptionId)
+                        .periodEnd().toInstant(ZoneOffset.UTC);
             }
         } else {
             throw conflict("当前订阅状态不能取消");
         }
+        String targetStatus = immediate ? "CANCELED" : "CANCEL_SCHEDULED";
+        appendSubscriptionEvent(tenantId, subscription.accountId(), subscriptionId,
+                immediate ? "cancel:immediate" : "cancel:end-of-term",
+                immediate ? "CANCELLED" : "CANCELLATION_REQUESTED",
+                previousStatus, targetStatus, subscription.planId(), subscription.planId(),
+                requestedAt, effectiveAt, Map.of("immediate", immediate));
         audit.record(tenantId, null, "SUBSCRIPTION_CANCEL", "SUBSCRIPTION", subscriptionId.toString());
         return view(tenantId, subscriptionId);
     }
@@ -146,7 +182,8 @@ public class SubscriptionService {
             throw new BusinessException(ErrorCode.INVALID_ARGUMENT, "目标套餐与当前套餐相同");
         }
         requireActivePlan(targetPlanId);
-        requireMonthlyPrice(targetPlanId, period.periodEnd().toInstant(ZoneOffset.UTC));
+        requireMonthlyPrice(targetPlanId, subscription.accountCurrency(),
+                period.periodEnd().toInstant(ZoneOffset.UTC));
         Long pending = jdbc.queryForObject("""
                 SELECT COUNT(*) FROM mb_subscription_change
                 WHERE subscription_id = ? AND status = 'SCHEDULED'
@@ -170,6 +207,11 @@ public class SubscriptionService {
             }
             requireSameRequest(raced.requestHash(), requestHash);
         }
+        appendSubscriptionEvent(tenantId, subscription.accountId(), subscriptionId,
+                "plan-change:" + idempotencyKey, "PLAN_CHANGE_REQUESTED",
+                subscription.status(), subscription.status(), subscription.planId(), targetPlanId,
+                clock.instant(), period.periodEnd().toInstant(ZoneOffset.UTC),
+                Map.of("idempotencyKey", idempotencyKey));
         audit.record(tenantId, null, "SUBSCRIPTION_PLAN_CHANGE_SCHEDULE", "SUBSCRIPTION", subscriptionId.toString());
         return view(tenantId, subscriptionId);
     }
@@ -188,7 +230,7 @@ public class SubscriptionService {
 
         PeriodRow period = requireActivePeriod(tenantId, subscriptionId);
         LocalDateTime periodEnd = period.periodEnd();
-        LocalDateTime nowUtc = LocalDateTime.ofInstant(Instant.now(), ZoneOffset.UTC);
+        LocalDateTime nowUtc = LocalDateTime.ofInstant(clock.instant(), ZoneOffset.UTC);
         if (nowUtc.isBefore(periodEnd)) {
             throw conflict("当前账期尚未结束");
         }
@@ -199,6 +241,10 @@ public class SubscriptionService {
                     WHERE id = ? AND status = 'ACTIVE'
                     """, period.id());
             updateStatus(tenantId, subscriptionId, "CANCEL_SCHEDULED", "EXPIRED");
+            appendSubscriptionEvent(tenantId, subscription.accountId(), subscriptionId,
+                    "expire:" + period.id(), "CANCELLED_EFFECTIVE",
+                    "CANCEL_SCHEDULED", "EXPIRED", subscription.planId(), subscription.planId(),
+                    clock.instant(), periodEnd.toInstant(ZoneOffset.UTC), Map.of("periodId", period.id()));
             audit.record(tenantId, null, "SUBSCRIPTION_EXPIRE", "SUBSCRIPTION", subscriptionId.toString());
             return view(tenantId, subscriptionId);
         }
@@ -210,7 +256,8 @@ public class SubscriptionService {
         Instant nextStart = periodEnd.toInstant(ZoneOffset.UTC);
         ZoneId zone = tenantZone(tenantId);
         Instant nextEnd = nextStart.atZone(zone).plusMonths(1).toInstant();
-        PlanPrice nextPrice = requireMonthlyPrice(nextPlanId, nextStart);
+        PlanPrice nextPrice = requireMonthlyPrice(
+                nextPlanId, subscription.accountCurrency(), nextStart);
         jdbc.update("""
                 UPDATE mb_subscription_period SET status = 'ENDED'
                 WHERE id = ? AND status = 'ACTIVE'
@@ -227,6 +274,10 @@ public class SubscriptionService {
                 SET status = 'APPLIED'
                 WHERE subscription_id = ? AND status = 'SCHEDULED'
                 """, subscriptionId);
+        appendSubscriptionEvent(tenantId, subscription.accountId(), subscriptionId,
+                "renew:" + period.id(), nextPlanId.equals(subscription.planId()) ? "RENEWED" : "PLAN_CHANGED",
+                "ACTIVE", "ACTIVE", subscription.planId(), nextPlanId,
+                clock.instant(), nextStart, Map.of("previousPeriodId", period.id()));
         audit.record(tenantId, null, "SUBSCRIPTION_RENEW", "SUBSCRIPTION", subscriptionId.toString());
         return view(tenantId, subscriptionId);
     }
@@ -243,13 +294,13 @@ public class SubscriptionService {
                 price.currency(), price.baseAmountMinor(), utc(activeFrom), utc(periodStart), utc(periodEnd));
     }
 
-    private PlanPrice requireMonthlyPrice(Long planId, Instant effectiveAt) {
+    private PlanPrice requireMonthlyPrice(Long planId, String currency, Instant effectiveAt) {
         List<PlanPrice> rows = jdbc.query("""
                 SELECT p.id AS price_id, pv.id AS price_version_id,
                        p.currency, pv.base_amount_minor
                 FROM mb_price p
                 JOIN mb_price_version pv ON pv.price_id = p.id
-                WHERE p.plan_id = ? AND p.billing_period = 'MONTHLY'
+                WHERE p.plan_id = ? AND p.currency = ? AND p.billing_period = 'MONTHLY'
                   AND pv.status = 'PUBLISHED'
                   AND pv.effective_at <= ?
                 ORDER BY pv.effective_at DESC
@@ -257,7 +308,7 @@ public class SubscriptionService {
                 """, (rs, n) -> new PlanPrice(
                 rs.getLong("price_id"), rs.getLong("price_version_id"),
                 rs.getString("currency"), rs.getLong("base_amount_minor")),
-                planId, utc(effectiveAt));
+                planId, currency, utc(effectiveAt));
         if (rows.isEmpty()) {
             throw conflict("套餐在目标账期没有已生效的月价版本");
         }
@@ -295,10 +346,14 @@ public class SubscriptionService {
 
     private SubscriptionRow findByIdempotencyKey(Long tenantId, String key) {
         List<SubscriptionRow> rows = jdbc.query("""
-                SELECT id, plan_id, status, request_hash
-                FROM mb_subscription WHERE tenant_id = ? AND idempotency_key = ?
+                SELECT s.id, s.account_id, s.plan_id, s.status, s.request_hash,
+                       a.currency AS account_currency
+                FROM mb_subscription s
+                JOIN mb_customer_account a ON a.id = s.account_id AND a.tenant_id = s.tenant_id
+                WHERE s.tenant_id = ? AND s.idempotency_key = ?
                 """, (rs, n) -> new SubscriptionRow(rs.getLong("id"), tenantId,
-                rs.getLong("plan_id"), rs.getString("status"), rs.getString("request_hash")),
+                rs.getLong("account_id"), rs.getLong("plan_id"), rs.getString("status"),
+                rs.getString("request_hash"), rs.getString("account_currency")),
                 tenantId, key);
         return rows.isEmpty() ? null : rows.getFirst();
     }
@@ -324,12 +379,16 @@ public class SubscriptionService {
 
     private SubscriptionRow requireSubscription(Long tenantId, Long id, boolean lock) {
         String sql = """
-                SELECT id, tenant_id, plan_id, status, request_hash
-                FROM mb_subscription WHERE tenant_id = ? AND id = ?
+                SELECT s.id, s.tenant_id, s.account_id, s.plan_id, s.status, s.request_hash,
+                       a.currency AS account_currency
+                FROM mb_subscription s
+                JOIN mb_customer_account a ON a.id = s.account_id AND a.tenant_id = s.tenant_id
+                WHERE s.tenant_id = ? AND s.id = ?
                 """ + (lock ? " FOR UPDATE" : "");
         List<SubscriptionRow> rows = jdbc.query(sql,
                 (rs, n) -> new SubscriptionRow(rs.getLong("id"), rs.getLong("tenant_id"),
-                        rs.getLong("plan_id"), rs.getString("status"), rs.getString("request_hash")),
+                        rs.getLong("account_id"), rs.getLong("plan_id"), rs.getString("status"),
+                        rs.getString("request_hash"), rs.getString("account_currency")),
                 tenantId, id);
         if (rows.isEmpty()) {
             throw new BusinessException(ErrorCode.RESOURCE_NOT_FOUND, "订阅不存在");
@@ -353,7 +412,7 @@ public class SubscriptionService {
 
     private SubscriptionVO view(Long tenantId, Long id) {
         List<SubscriptionVO> rows = jdbc.query("""
-                SELECT s.id, s.tenant_id, s.plan_id, s.status,
+                SELECT s.id, s.tenant_id, s.account_id, s.plan_id, s.status,
                        p.price_version_id, p.currency, p.base_amount_minor, p.id AS period_id,
                        p.active_from, p.period_start, p.period_end
                 FROM mb_subscription s
@@ -365,7 +424,7 @@ public class SubscriptionService {
                   )
                 WHERE s.tenant_id = ? AND s.id = ?
                 """, (rs, n) -> new SubscriptionVO(
-                rs.getLong("id"), rs.getLong("tenant_id"), rs.getLong("plan_id"),
+                rs.getLong("id"), rs.getLong("tenant_id"), rs.getLong("account_id"), rs.getLong("plan_id"),
                 rs.getString("status"), (Long) rs.getObject("price_version_id"),
                 rs.getString("currency"), (Long) rs.getObject("base_amount_minor"),
                 instant(rs.getObject("active_from", LocalDateTime.class)),
@@ -376,6 +435,50 @@ public class SubscriptionService {
             throw new BusinessException(ErrorCode.RESOURCE_NOT_FOUND, "订阅不存在");
         }
         return rows.getFirst();
+    }
+
+    @Transactional(readOnly = true)
+    public List<SubscriptionEventVO> timeline(Long tenantId, Long subscriptionId) {
+        requireSubscription(tenantId, subscriptionId, false);
+        return jdbc.query("""
+                SELECT id, subscription_id, event_type, from_status, to_status,
+                       from_plan_id, to_plan_id, requested_at, effective_at, metadata_json
+                FROM mb_subscription_event
+                WHERE tenant_id = ? AND subscription_id = ?
+                ORDER BY effective_at, id
+                """, (rs, n) -> new SubscriptionEventVO(rs.getLong("id"),
+                rs.getLong("subscription_id"), rs.getString("event_type"),
+                rs.getString("from_status"), rs.getString("to_status"),
+                (Long) rs.getObject("from_plan_id"), (Long) rs.getObject("to_plan_id"),
+                instant(rs.getObject("requested_at", LocalDateTime.class)),
+                instant(rs.getObject("effective_at", LocalDateTime.class)),
+                rs.getString("metadata_json")), tenantId, subscriptionId);
+    }
+
+    private void appendSubscriptionEvent(Long tenantId, Long accountId, Long subscriptionId,
+                                         String eventKey, String eventType,
+                                         String fromStatus, String toStatus,
+                                         Long fromPlanId, Long toPlanId,
+                                         Instant requestedAt, Instant effectiveAt,
+                                         Map<String, ?> metadata) {
+        String metadataJson;
+        try {
+            metadataJson = new com.fasterxml.jackson.databind.ObjectMapper().writeValueAsString(metadata);
+        } catch (com.fasterxml.jackson.core.JsonProcessingException ex) {
+            throw new IllegalArgumentException("订阅事件载荷无法序列化", ex);
+        }
+        jdbc.update("""
+                INSERT IGNORE INTO mb_subscription_event
+                    (tenant_id, account_id, subscription_id, event_key, event_type,
+                     from_status, to_status, from_plan_id, to_plan_id,
+                     requested_at, effective_at, metadata_json)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, CAST(? AS JSON))
+                """, tenantId, accountId, subscriptionId, eventKey, eventType,
+                fromStatus, toStatus, fromPlanId, toPlanId,
+                utc(requestedAt), utc(effectiveAt), metadataJson);
+        events.append(tenantId, accountId, "SUBSCRIPTION", subscriptionId, null,
+                "SUBSCRIPTION_" + eventType, "subscription:" + subscriptionId + ":" + eventKey,
+                null, metadata);
     }
 
     private void updateStatus(Long tenantId, Long id, String from, String to) {
@@ -423,7 +526,8 @@ public class SubscriptionService {
     }
 
     private record SubscriptionRow(
-            Long id, Long tenantId, Long planId, String status, String requestHash) {
+            Long id, Long tenantId, Long accountId, Long planId, String status,
+            String requestHash, String accountCurrency) {
     }
 
     private record ChangeRow(String requestHash) {

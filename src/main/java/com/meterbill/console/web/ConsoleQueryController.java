@@ -136,7 +136,7 @@ public class ConsoleQueryController {
                 TenantContext.requiredTenantId(), status, limit));
     }
 
-    @Operation(summary = "查询当前租户账务分录", description = "可按账单反查账单、调整、支付、退款和冲正产生的分录")
+    @Operation(summary = "查询当前租户账务分录", description = "可按账单反查账单、调整、支付、退款和支付撤销产生的分录")
     @GetMapping("/api/v1/tenant/ledger/entries")
     public ApiResponse<List<LedgerEntryRow>> ledgerEntries(
             @RequestParam(required = false) Long invoiceId,

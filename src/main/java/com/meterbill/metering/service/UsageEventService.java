@@ -17,6 +17,7 @@ import java.security.NoSuchAlgorithmException;
 import java.time.Instant;
 import java.time.LocalDateTime;
 import java.time.ZoneOffset;
+import java.time.temporal.ChronoUnit;
 import java.util.HexFormat;
 import java.util.List;
 
@@ -52,6 +53,7 @@ public class UsageEventService {
                     "立即取消后的时间不能接收用量事件");
         }
 
+        Instant receivedAt = Instant.now().truncatedTo(ChronoUnit.MICROS);
         Long eventDbId;
         try {
             var keys = new org.springframework.jdbc.support.GeneratedKeyHolder();
@@ -60,12 +62,12 @@ public class UsageEventService {
                     INSERT INTO mb_usage_event
                         (tenant_id, subscription_id, period_id, meter_id,
                          source_id, event_id, model_code, quantity, occurred_at,
-                         payload_hash, status)
-                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'RECEIVED')
+                         received_at, payload_hash, status)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'RECEIVED')
                     """, java.sql.Statement.RETURN_GENERATED_KEYS);
                 Object[] values = {tenantId, request.subscriptionId(), period.id(), period.meterId(),
                         request.sourceId(), request.eventId(), request.modelCode(), request.quantity(),
-                        utc(request.occurredAt()), payloadHash};
+                        utc(request.occurredAt()), utc(receivedAt), payloadHash};
                 for (int index=0; index<values.length; index++) statement.setObject(index+1, values[index]);
                 return statement;
             }, keys);
@@ -83,7 +85,9 @@ public class UsageEventService {
                 INSERT INTO mb_outbox (event_type, event_id, status)
                 VALUES ('USAGE_EVENT_ACCEPTED', ?, 'READY')
                 """, eventDbId);
-        return getById(tenantId, eventDbId);
+        return new UsageEventVO(eventDbId, request.subscriptionId(), request.sourceId(),
+                request.eventId(), request.meterCode(), request.modelCode(), request.quantity(),
+                request.occurredAt(), receivedAt, "RECEIVED", 0, null, null);
     }
 
     @Transactional(readOnly = true)

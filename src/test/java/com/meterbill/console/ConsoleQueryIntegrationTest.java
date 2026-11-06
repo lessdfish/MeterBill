@@ -23,6 +23,7 @@ import static org.junit.jupiter.api.Assertions.assertThrows;
 
 @Testcontainers
 @SpringBootTest
+@org.springframework.test.annotation.DirtiesContext(classMode = org.springframework.test.annotation.DirtiesContext.ClassMode.AFTER_CLASS)
 @ActiveProfiles("test")
 class ConsoleQueryIntegrationTest {
 
@@ -100,6 +101,12 @@ class ConsoleQueryIntegrationTest {
         String suffix = name + UUID.randomUUID().toString().replace("-", "").substring(0, 8);
         jdbc.update("INSERT INTO mb_tenant(tenant_code,name) VALUES (?,?)", suffix, "Tenant " + name);
         Long tenant = lastId();
+        jdbc.update("""
+                INSERT INTO mb_customer_account
+                    (tenant_id,external_key,name,currency,time_zone_id,is_default)
+                VALUES (?,?,?,'CNY','UTC',TRUE)
+                """, tenant, "account-" + suffix, "Account " + name);
+        Long account = lastId();
         jdbc.update("INSERT INTO mb_user(email,password_hash,display_name) VALUES (?,?,?)",
                 suffix + "@example.test", "hash", "User " + name);
         Long user = lastId();
@@ -116,8 +123,8 @@ class ConsoleQueryIntegrationTest {
         Long version = lastId();
         jdbc.update("INSERT INTO mb_usage_meter(product_id,meter_code,name,unit) VALUES (?,?,?,'request')", product, "meter-" + suffix, "Requests");
         Long meter = lastId();
-        jdbc.update("INSERT INTO mb_subscription(tenant_id,plan_id,idempotency_key,request_hash,status) VALUES (?,?,?,?,'ACTIVE')",
-                tenant, plan, "sub-" + suffix, "0".repeat(64));
+        jdbc.update("INSERT INTO mb_subscription(tenant_id,account_id,plan_id,idempotency_key,request_hash,status) VALUES (?,?,?,?,?,'ACTIVE')",
+                tenant, account, plan, "sub-" + suffix, "0".repeat(64));
         Long subscription = lastId();
         LocalDateTime start = LocalDateTime.now().minusDays(5);
         LocalDateTime end = LocalDateTime.now().plusDays(25);
@@ -136,15 +143,15 @@ class ConsoleQueryIntegrationTest {
         Long event = lastId();
         jdbc.update("INSERT INTO mb_outbox(event_type,event_id,status,attempt_count,last_error) VALUES ('USAGE_EVENT',?,'RETRYABLE_FAILED',2,'timeout')", event);
         jdbc.update("""
-                INSERT INTO mb_invoice(tenant_id,subscription_id,period_id,price_version_id,currency,
+                INSERT INTO mb_invoice(tenant_id,account_id,subscription_id,period_id,price_version_id,currency,
                     period_start,period_end,base_amount_minor,usage_amount_minor,total_amount_minor,status)
-                VALUES (?,?,?,?,'CNY',?,?,2500,0,2500,'ISSUED')
-                """, tenant, subscription, period, version, start, end);
+                VALUES (?,?,?,?,?,'CNY',?,?,2500,0,2500,'ISSUED')
+                """, tenant, account, subscription, period, version, start, end);
         Long invoice = lastId();
         jdbc.update("""
-                INSERT INTO mb_payment(tenant_id,invoice_id,idempotency_key,request_hash,external_reference,currency,amount_minor,status)
-                VALUES (?,?,?,? ,?,'CNY',2500,'UNKNOWN')
-                """, tenant, invoice, "pay-" + suffix, "2".repeat(64), "external-" + suffix);
+                INSERT INTO mb_payment(tenant_id,account_id,invoice_id,idempotency_key,request_hash,external_reference,currency,amount_minor,status)
+                VALUES (?,?,?,?,?,?,'CNY',2500,'UNKNOWN')
+                """, tenant, account, invoice, "pay-" + suffix, "2".repeat(64), "external-" + suffix);
         Long payment = lastId();
         jdbc.update("""
                 INSERT INTO mb_channel_transaction(tenant_id,payment_id,channel_code,external_reference,

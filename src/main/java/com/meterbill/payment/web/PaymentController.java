@@ -9,6 +9,7 @@ import com.meterbill.payment.web.dto.CreateRefundRequest;
 import com.meterbill.payment.web.dto.SimulateResultRequest;
 import com.meterbill.payment.web.vo.PaymentVO;
 import com.meterbill.payment.web.vo.RefundVO;
+import com.meterbill.payment.web.vo.PaymentTransactionVO;
 import com.meterbill.product.security.PlatAdminGuard;
 import io.swagger.v3.oas.annotations.Operation;
 import io.swagger.v3.oas.annotations.tags.Tag;
@@ -26,6 +27,7 @@ public class PaymentController {
     private final PaymentService payments;
     private final PlatAdminGuard adminGuard;
     private final TenantRoleService roles;
+    private final com.meterbill.payment.service.PaymentTransactionService transactions;
 
     @Operation(summary = "创建模拟支付")
     @PostMapping("/api/v1/tenant/invoices/{invoiceId}/payments")
@@ -45,6 +47,12 @@ public class PaymentController {
     public ApiResponse<PaymentVO> getPayment(@PathVariable Long paymentId) {
         return ApiResponse.success(payments.getPayment(
                 TenantContext.requiredTenantId(), paymentId));
+    }
+
+    @Operation(summary = "查询支付交易尝试")
+    @GetMapping("/api/v1/tenant/payments/{paymentId}/transactions")
+    public ApiResponse<java.util.List<PaymentTransactionVO>> paymentTransactions(@PathVariable Long paymentId) {
+        return ApiResponse.success(transactions.forPayment(TenantContext.requiredTenantId(), paymentId));
     }
 
     @Operation(summary = "记录支付渠道回调")
@@ -79,6 +87,12 @@ public class PaymentController {
                 TenantContext.requiredTenantId(), refundId));
     }
 
+    @Operation(summary = "查询退款交易尝试")
+    @GetMapping("/api/v1/tenant/refunds/{refundId}/transactions")
+    public ApiResponse<java.util.List<PaymentTransactionVO>> refundTransactions(@PathVariable Long refundId) {
+        return ApiResponse.success(transactions.forRefund(TenantContext.requiredTenantId(), refundId));
+    }
+
     @Operation(summary = "记录退款渠道回调")
     @PostMapping("/api/v1/platform/refunds/{refundId}/simulate-result")
     public ApiResponse<RefundVO> simulateRefundResult(
@@ -95,12 +109,12 @@ public class PaymentController {
         return Long.valueOf(jwt.getSubject());
     }
 
-    @Operation(summary = "冲正整笔成功支付", description = "仅平台管理员可执行，并保留原支付和账务记录")
-    @PostMapping("/api/v1/platform/payments/{paymentId}/reversal")
-    public ApiResponse<Long> reverse(@AuthenticationPrincipal Jwt jwt, @PathVariable Long paymentId,
-                                     @Valid @RequestBody ReversalRequest request) {
+    @Operation(summary = "撤销整笔成功支付", description = "仅平台管理员可执行，并保留原支付和账务记录")
+    @PostMapping("/api/v1/platform/payments/{paymentId}/revoke")
+    public ApiResponse<Long> revoke(@AuthenticationPrincipal Jwt jwt, @PathVariable Long paymentId,
+                                    @Valid @RequestBody RevocationRequest request) {
         adminGuard.requireAdmin(userId(jwt));
-        return ApiResponse.success(payments.reversePayment(paymentId, userId(jwt), request.reason()));
+        return ApiResponse.success(payments.revokePayment(paymentId, userId(jwt), request.reason()));
     }
     @Operation(summary = "主动查询支付渠道结果")
     @PostMapping("/api/v1/platform/payments/{paymentId}/query-channel")
@@ -114,5 +128,5 @@ public class PaymentController {
         adminGuard.requireAdmin(userId(jwt));
         return ApiResponse.success(payments.queryRefundChannel(refundId, userId(jwt)));
     }
-    public record ReversalRequest(@jakarta.validation.constraints.NotBlank @jakarta.validation.constraints.Size(max=500) String reason) { }
+    public record RevocationRequest(@jakarta.validation.constraints.NotBlank @jakarta.validation.constraints.Size(max=500) String reason) { }
 }

@@ -29,12 +29,12 @@ public class TenantRoleSetup {
                             "TENANT_READ",
                             "MEMBER_ROLE_MANAGE",
                             "API_KEY_MANAGE",
-                            "AUDIT_READ", "SUBSCRIPTION_MANAGE", "PAYMENT_MANAGE", "RECONCILIATION_RUN"),
+                            "AUDIT_READ", "ACCOUNT_MANAGE", "SUBSCRIPTION_MANAGE", "PAYMENT_MANAGE", "RECONCILIATION_RUN"),
                     "ADMIN", List.of(
                             "TENANT_READ",
                             "MEMBER_ROLE_MANAGE",
                             "API_KEY_MANAGE",
-                            "AUDIT_READ", "SUBSCRIPTION_MANAGE", "PAYMENT_MANAGE", "RECONCILIATION_RUN"),
+                            "AUDIT_READ", "ACCOUNT_MANAGE", "SUBSCRIPTION_MANAGE", "PAYMENT_MANAGE", "RECONCILIATION_RUN"),
                     "VIEWER", List.of("TENANT_READ")
             );
 

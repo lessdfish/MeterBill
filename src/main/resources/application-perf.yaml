@@ -1,0 +1,20 @@
+spring:
+  datasource:
+    url: jdbc:mysql://${MYSQL_HOST:127.0.0.1}:${MYSQL_HOST_PORT:13306}/${MYSQL_DATABASE:meterbill_perf}?connectionTimeZone=UTC&forceConnectionTimeZoneToSession=true
+  flyway:
+    locations: classpath:db/migration,classpath:db/performance
+
+logging:
+  level:
+    root: INFO
+    com.meterbill: INFO
+
+meterbill:
+  bootstrap:
+    enabled: true
+    email: ${METERBILL_BOOTSTRAP_EMAIL:perf-admin@meterbill.local}
+    password: ${METERBILL_BOOTSTRAP_PASSWORD:MeterBill-Perf-2026!}
+    tenant-code: ${METERBILL_BOOTSTRAP_TENANT_CODE:PERF_ADMIN}
+    tenant-name: MeterBill 性能管理员
+  performance-data:
+    enabled: true

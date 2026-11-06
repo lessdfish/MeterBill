@@ -43,6 +43,7 @@ import static org.junit.jupiter.api.Assertions.assertTrue;
 
 @Testcontainers
 @SpringBootTest
+@org.springframework.test.annotation.DirtiesContext(classMode = org.springframework.test.annotation.DirtiesContext.ClassMode.AFTER_CLASS)
 @ActiveProfiles("test")
 class ReliabilityReconciliationIntegrationTest {
 
@@ -213,7 +214,7 @@ class ReliabilityReconciliationIntegrationTest {
         usageEventProcessor.process(eventId);
         usageEventProcessor.process(eventId);
         assertEquals(17L, jdbc.queryForObject("""
-                SELECT total_quantity FROM mb_usage_period_total WHERE period_id = ?
+                SELECT SUM(total_quantity) FROM mb_usage_period_total WHERE period_id = ?
                 """, Long.class, fixture.periodId()));
         assertEquals(1, jdbc.queryForObject("""
                 SELECT COUNT(*) FROM mb_usage_event_processed WHERE usage_event_id = ?
@@ -233,6 +234,12 @@ class ReliabilityReconciliationIntegrationTest {
         jdbc.update("INSERT INTO mb_tenant(tenant_code, name) VALUES (?, ?)",
                 "reliable-" + suffix, "Reliability Test");
         Long tenantId = jdbc.queryForObject("SELECT LAST_INSERT_ID()", Long.class);
+        jdbc.update("""
+                INSERT INTO mb_customer_account
+                    (tenant_id, external_key, name, currency, time_zone_id, is_default)
+                VALUES (?, ?, 'Reliability Account', 'CNY', 'UTC', TRUE)
+                """, tenantId, "reliable-account-" + suffix);
+        Long accountId = jdbc.queryForObject("SELECT LAST_INSERT_ID()", Long.class);
         jdbc.update("INSERT INTO mb_product(product_code, name, status) VALUES (?, ?, 'ACTIVE')",
                 "reliable-product-" + suffix, "Reliability Product");
         Long productId = jdbc.queryForObject("SELECT LAST_INSERT_ID()", Long.class);
@@ -257,9 +264,10 @@ class ReliabilityReconciliationIntegrationTest {
                 Instant.now().minusSeconds(120L * 86400), ZoneOffset.UTC));
         Long versionId = jdbc.queryForObject("SELECT LAST_INSERT_ID()", Long.class);
         jdbc.update("""
-                INSERT INTO mb_subscription(tenant_id, plan_id, idempotency_key, request_hash, status)
-                VALUES (?, ?, ?, ?, 'ACTIVE')
-                """, tenantId, planId, "reliable-" + suffix, "0".repeat(64));
+                INSERT INTO mb_subscription
+                    (tenant_id, account_id, plan_id, idempotency_key, request_hash, status)
+                VALUES (?, ?, ?, ?, ?, 'ACTIVE')
+                """, tenantId, accountId, planId, "reliable-" + suffix, "0".repeat(64));
         Long subscriptionId = jdbc.queryForObject("SELECT LAST_INSERT_ID()", Long.class);
         LocalDateTime start = LocalDateTime.ofInstant(
                 Instant.now().minusSeconds(90L * 86400), ZoneOffset.UTC);

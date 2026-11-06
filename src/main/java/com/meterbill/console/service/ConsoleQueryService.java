@@ -418,7 +418,7 @@ public class ConsoleQueryService {
                        (t.business_type = 'INVOICE' AND t.business_id = ?)
                        OR (t.business_type = 'INVOICE_ADJUSTMENT' AND EXISTS
                            (SELECT 1 FROM mb_invoice_adjustment a WHERE a.id=t.business_id AND a.invoice_id=?))
-                       OR (t.business_type IN ('PAYMENT','PAYMENT_REVERSAL') AND EXISTS
+                       OR (t.business_type IN ('PAYMENT','PAYMENT_REVOCATION') AND EXISTS
                            (SELECT 1 FROM mb_payment p WHERE p.id=t.business_id AND p.invoice_id=?))
                        OR (t.business_type = 'REFUND' AND EXISTS
                            (SELECT 1 FROM mb_refund r JOIN mb_payment p ON p.id=r.payment_id
@@ -520,8 +520,8 @@ public class ConsoleQueryService {
         if (action.contains("RESULT")) {
             return "更新支付结果";
         }
-        if (action.contains("REVERSE")) {
-            return "支付冲正";
+        if (action.contains("REVOKE")) {
+            return "支付撤销";
         }
         return "操作记录";
     }

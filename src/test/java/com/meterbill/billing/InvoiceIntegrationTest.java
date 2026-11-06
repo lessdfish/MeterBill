@@ -28,6 +28,7 @@ import static org.junit.jupiter.api.Assertions.assertTrue;
 
 @Testcontainers
 @SpringBootTest
+@org.springframework.test.annotation.DirtiesContext(classMode = org.springframework.test.annotation.DirtiesContext.ClassMode.AFTER_CLASS)
 @ActiveProfiles("test")
 class InvoiceIntegrationTest {
 
@@ -115,6 +116,7 @@ class InvoiceIntegrationTest {
         jdbc.update("INSERT INTO mb_tenant(tenant_code, name) VALUES (?, ?)",
                 "billing-" + suffix, "Billing Test");
         Long tenantId = jdbc.queryForObject("SELECT LAST_INSERT_ID()", Long.class);
+        Long accountId = accounts.requireDefault(tenantId).id();
         jdbc.update("INSERT INTO mb_product(product_code, name, status) VALUES (?, ?, 'ACTIVE')",
                 "billing-product-" + suffix, "Billing Product");
         Long productId = jdbc.queryForObject("SELECT LAST_INSERT_ID()", Long.class);
@@ -152,9 +154,9 @@ class InvoiceIntegrationTest {
         }
 
         jdbc.update("""
-                INSERT INTO mb_subscription(tenant_id, plan_id, idempotency_key, request_hash, status)
-                VALUES (?, ?, ?, ?, 'ACTIVE')
-                """, tenantId, planId, "billing-" + suffix, "0".repeat(64));
+                INSERT INTO mb_subscription(tenant_id, account_id, plan_id, idempotency_key, request_hash, status)
+                VALUES (?, ?, ?, ?, ?, 'ACTIVE')
+                """, tenantId, accountId, planId, "billing-" + suffix, "0".repeat(64));
         Long subscriptionId = jdbc.queryForObject("SELECT LAST_INSERT_ID()", Long.class);
         Instant now = Instant.now();
         LocalDateTime start = LocalDateTime.ofInstant(now.minusSeconds(90 * 86400), ZoneOffset.UTC);
@@ -227,6 +229,7 @@ class InvoiceIntegrationTest {
     @Autowired private com.meterbill.product.service.ModelCatalogService models;
     @Autowired private com.meterbill.metering.service.UsageEventService usage;
     @Autowired private com.meterbill.metering.service.UsageEventProcessor processor;
+    @Autowired private com.meterbill.account.api.AccountQueryApi accounts;
 
     @Test
     void twoModelsInputOutputRatesAreIsolatedAndUnregisteredPairsRejected() throws Exception {

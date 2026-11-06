@@ -5,6 +5,7 @@ import java.time.Instant;
 public record RefundVO(
         Long id,
         Long tenantId,
+        Long accountId,
         Long paymentId,
         String externalReference,
         String currency,

@@ -29,7 +29,7 @@ public class SimulatedChannelService {
         var old = jdbc.query("SELECT tenant_id,transaction_type,currency,amount_minor,status FROM mb_channel_transaction WHERE channel_code='SIMULATED' AND external_reference=? FOR UPDATE",
                 (rs,n)->new Object[]{rs.getLong(1),rs.getString(2),rs.getString(3),rs.getLong(4),rs.getString(5)},reference).getFirst();
         if (!tenant.equals(old[0]) || !type.equals(old[1]) || !currency.equals(old[2]) || amount!=(Long)old[3]
-                || (List.of("SUCCEEDED","FAILED","REVERSED").contains(old[4]) && !status.equals(old[4])))
+                || (List.of("SUCCEEDED","FAILED","REVOKED").contains(old[4]) && !status.equals(old[4])))
             throw new BusinessException(ErrorCode.BUSINESS_CONFLICT, "不能改写渠道事实或终态");
         jdbc.update("UPDATE mb_channel_transaction SET status=? WHERE external_reference=? AND channel_code='SIMULATED'",status,reference);
         audit.record(tenant,actor,"CHANNEL_OBSERVE","CHANNEL_TRANSACTION",reference);

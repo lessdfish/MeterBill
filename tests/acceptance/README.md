@@ -23,7 +23,7 @@ This session uses a single application on 8086, with 8085 stopped. It does not u
 1. `run-gap-setup.ps1` creates the prefixed synthetic dataset and records its run ID.
 2. `run-gap-performance.ps1 -Run <run> -Label <unique-label>` executes bounded and unlimited load, resource sampling, drain, exact billing and reconciliation checks. Use a new dataset and label for each complete comparison; do not overwrite old evidence.
 3. `analyze-gap-performance.ps1 -Run <run> -Label <label>` derives processing throughput, exact HTTP-end backlog and ingest-to-processed latency from JTL and database timestamps.
-4. `run-gap-features.ps1 -Run <run>` verifies platform permissions, independent channel recovery and reversal on the generated unpaid performance invoice.
+4. `run-gap-features.ps1 -Run <run>` verifies platform permissions, independent channel recovery and payment revocation on the generated unpaid performance invoice.
 5. `close-gap-experiments.ps1` revokes keys and disables only this session's three explicitly listed synthetic account pairs, removes their temporary credentials, and leaves 8086 running. It intentionally preserves financial and usage evidence.
 
 `complete-gap-performance.ps1` recovers verification after an interrupted run; it does not make interrupted timing comparable. The first baseline's interruption and source filter issue remain documented in its adjudication file. See `docs/G01-G04-修复与性能优化报告-2026-10-12.md` for the final comparison and deferred work. Apifox is user-owned.

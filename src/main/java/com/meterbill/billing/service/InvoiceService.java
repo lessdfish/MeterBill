@@ -2,6 +2,7 @@ package com.meterbill.billing.service;
 
 import com.meterbill.common.exception.BusinessException;
 import com.meterbill.common.exception.ErrorCode;
+import com.meterbill.common.event.DomainEventService;
 import com.meterbill.product.domain.PricingMode;
 import com.meterbill.product.domain.UsageChargeCalculator;
 import com.meterbill.billing.web.vo.InvoiceAdjustmentVO;
@@ -14,6 +15,7 @@ import org.springframework.transaction.annotation.Transactional;
 
 import java.math.BigInteger;
 import java.time.Instant;
+import java.time.Clock;
 import java.time.LocalDateTime;
 import java.time.ZoneOffset;
 import java.util.ArrayList;
@@ -27,6 +29,8 @@ public class InvoiceService {
 
     private final JdbcTemplate jdbc;
     private final InvoiceAccountingService accounting;
+    private final DomainEventService events;
+    private final Clock clock;
 
     @Transactional(readOnly = true)
     public List<Long> findDueUnbilledPeriodIds(int limit) {
@@ -51,7 +55,7 @@ public class InvoiceService {
             accounting.synchronize(period.tenantId(), existing.id());
             return getInvoice(period.tenantId(), existing.id());
         }
-        if (period.periodEnd().isAfter(LocalDateTime.now(ZoneOffset.UTC))) {
+        if (period.periodEnd().isAfter(LocalDateTime.ofInstant(clock.instant(), ZoneOffset.UTC))) {
             throw conflict("账期尚未结束，不能出账");
         }
         requireAllEventsProcessed(period);
@@ -83,31 +87,31 @@ public class InvoiceService {
 
         jdbc.update("""
                 INSERT INTO mb_invoice
-                    (tenant_id, subscription_id, period_id, price_version_id, currency,
+                    (tenant_id, account_id, subscription_id, period_id, price_version_id, currency,
                      period_start, period_end, base_amount_minor, usage_amount_minor,
                      total_amount_minor, status)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'ISSUED')
-                """, period.tenantId(), period.subscriptionId(), period.id(),
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'ISSUED')
+                """, period.tenantId(), period.accountId(), period.subscriptionId(), period.id(),
                 period.priceVersionId(), period.currency(), period.periodStart(), period.periodEnd(),
                 period.baseAmountMinor(), usageAmount, invoiceTotal);
         Long invoiceId = jdbc.queryForObject("SELECT LAST_INSERT_ID()", Long.class);
 
         jdbc.update("""
                 INSERT INTO mb_invoice_line
-                    (invoice_id, line_no, line_type, description, quantity,
+                    (invoice_id, account_id, line_no, line_type, description, quantity,
                      included_quantity, billable_quantity, amount_minor, rate_snapshot)
-                VALUES (?, 1, 'BASE', 'Monthly subscription fee', 0, 0, 0, ?, ?)
-                """, invoiceId, period.baseAmountMinor(),
+                VALUES (?, ?, 1, 'BASE', 'Monthly subscription fee', 0, 0, 0, ?, ?)
+                """, invoiceId, period.accountId(), period.baseAmountMinor(),
                 "priceVersionId=" + period.priceVersionId()
                         + ";baseAmountMinor=" + period.baseAmountMinor());
         for (RatedLine line : ratedLines) {
             jdbc.update("""
                     INSERT INTO mb_invoice_line
-                        (invoice_id, line_no, line_type, meter_id, description,
+                        (invoice_id, account_id, line_no, line_type, meter_id, description,
                          pricing_mode, quantity, included_quantity, billable_quantity,
                          amount_minor, rate_snapshot)
-                    VALUES (?, ?, 'USAGE', ?, ?, ?, ?, ?, ?, ?, ?)
-                    """, invoiceId, line.lineNo(), line.rule().meterId(),
+                    VALUES (?, ?, ?, 'USAGE', ?, ?, ?, ?, ?, ?, ?, ?)
+                    """, invoiceId, period.accountId(), line.lineNo(), line.rule().meterId(),
                     "Usage: " + line.rule().meterCode(), line.rule().mode().name(),
                     line.quantity(), line.rule().includedQuantity(), line.billableQuantity(),
                     line.amountMinor(), line.rule().snapshot(period.priceVersionId()));
@@ -121,6 +125,10 @@ public class InvoiceService {
                   )
                 """, invoiceId, period.id());
         accounting.synchronize(period.tenantId(), invoiceId);
+        events.append(period.tenantId(), period.accountId(), "INVOICE", invoiceId, 0L,
+                "INVOICE_ISSUED", "invoice:" + invoiceId + ":issued", null,
+                Map.of("subscriptionId", period.subscriptionId(), "periodId", period.id(),
+                        "currency", period.currency(), "totalAmountMinor", invoiceTotal));
         return getInvoice(period.tenantId(), invoiceId);
     }
 
@@ -225,18 +233,22 @@ public class InvoiceService {
                     """, event.id(), adjustmentId);
         }
         accounting.synchronize(period.tenantId(), invoice.id());
+        events.append(period.tenantId(), period.accountId(), "INVOICE_ADJUSTMENT", adjustmentId, 0L,
+                "INVOICE_ADJUSTED", "invoice-adjustment:" + adjustmentId + ":issued", null,
+                Map.of("invoiceId", invoice.id(), "amountMinor", adjustmentAmount,
+                        "sourceEventCount", lateEvents.size()));
         return getAdjustment(period.tenantId(), adjustmentId);
     }
 
     @Transactional(readOnly = true)
     public InvoiceVO getInvoice(Long tenantId, Long invoiceId) {
         List<InvoiceRow> invoices = jdbc.query("""
-                SELECT id, tenant_id, subscription_id, period_id, price_version_id,
+                SELECT id, tenant_id, account_id, subscription_id, period_id, price_version_id,
                        currency, period_start, period_end, base_amount_minor,
                        usage_amount_minor, total_amount_minor, status, issued_at
                 FROM mb_invoice WHERE tenant_id = ? AND id = ?
                 """, (rs, row) -> new InvoiceRow(
-                rs.getLong("id"), rs.getLong("tenant_id"), rs.getLong("subscription_id"),
+                rs.getLong("id"), rs.getLong("tenant_id"), rs.getLong("account_id"), rs.getLong("subscription_id"),
                 rs.getLong("period_id"), rs.getLong("price_version_id"), rs.getString("currency"),
                 rs.getObject("period_start", LocalDateTime.class),
                 rs.getObject("period_end", LocalDateTime.class), rs.getLong("base_amount_minor"),
@@ -252,7 +264,7 @@ public class InvoiceService {
                 """, (rs, row) -> rs.getLong(1), invoiceId);
         List<InvoiceAdjustmentVO> adjustments = adjustmentIds.stream()
                 .map(id -> getAdjustment(tenantId, id)).toList();
-        return new InvoiceVO(invoice.id(), invoice.tenantId(), invoice.subscriptionId(),
+        return new InvoiceVO(invoice.id(), invoice.tenantId(), invoice.accountId(), invoice.subscriptionId(),
                 invoice.periodId(), invoice.priceVersionId(), invoice.currency(),
                 instant(invoice.periodStart()), instant(invoice.periodEnd()),
                 invoice.baseAmountMinor(), invoice.usageAmountMinor(), invoice.totalAmountMinor(),
@@ -307,12 +319,14 @@ public class InvoiceService {
 
     private BillingPeriod requirePeriod(Long periodId, boolean lock) {
         String sql = """
-                SELECT sp.id, sp.tenant_id, sp.subscription_id, sp.price_version_id,
+                SELECT sp.id, sp.tenant_id, s.account_id, sp.subscription_id, sp.price_version_id,
                        sp.currency, sp.base_amount_minor, sp.period_start, sp.period_end
-                FROM mb_subscription_period sp WHERE sp.id = ?
+                FROM mb_subscription_period sp
+                JOIN mb_subscription s ON s.id = sp.subscription_id AND s.tenant_id = sp.tenant_id
+                WHERE sp.id = ?
                 """ + (lock ? " FOR UPDATE" : "");
         List<BillingPeriod> rows = jdbc.query(sql, (rs, row) -> new BillingPeriod(
-                rs.getLong("id"), rs.getLong("tenant_id"), rs.getLong("subscription_id"),
+                rs.getLong("id"), rs.getLong("tenant_id"), rs.getLong("account_id"), rs.getLong("subscription_id"),
                 rs.getLong("price_version_id"), rs.getString("currency"),
                 rs.getLong("base_amount_minor"), rs.getObject("period_start", LocalDateTime.class),
                 rs.getObject("period_end", LocalDateTime.class)), periodId);
@@ -324,12 +338,12 @@ public class InvoiceService {
 
     private InvoiceRow findInvoice(Long periodId) {
         List<InvoiceRow> rows = jdbc.query("""
-                SELECT id, tenant_id, subscription_id, period_id, price_version_id,
+                SELECT id, tenant_id, account_id, subscription_id, period_id, price_version_id,
                        currency, period_start, period_end, base_amount_minor,
                        usage_amount_minor, total_amount_minor, status, issued_at
                 FROM mb_invoice WHERE period_id = ?
                 """, (rs, row) -> new InvoiceRow(
-                rs.getLong("id"), rs.getLong("tenant_id"), rs.getLong("subscription_id"),
+                rs.getLong("id"), rs.getLong("tenant_id"), rs.getLong("account_id"), rs.getLong("subscription_id"),
                 rs.getLong("period_id"), rs.getLong("price_version_id"), rs.getString("currency"),
                 rs.getObject("period_start", LocalDateTime.class),
                 rs.getObject("period_end", LocalDateTime.class), rs.getLong("base_amount_minor"),
@@ -352,8 +366,10 @@ public class InvoiceService {
     private Map<Long, Long> periodTotals(Long periodId) {
         Map<Long, Long> totals = new LinkedHashMap<>();
         jdbc.query("""
-                SELECT meter_id, total_quantity FROM mb_usage_period_total
-                WHERE period_id = ? ORDER BY meter_id
+                SELECT meter_id, SUM(total_quantity) AS total_quantity
+                FROM mb_usage_period_total
+                WHERE period_id = ?
+                GROUP BY meter_id ORDER BY meter_id
                 """, rs -> {
             totals.put(rs.getLong("meter_id"), rs.getLong("total_quantity"));
         }, periodId);
@@ -459,12 +475,12 @@ public class InvoiceService {
         return new BusinessException(ErrorCode.BUSINESS_CONFLICT, message);
     }
 
-    private record BillingPeriod(Long id, Long tenantId, Long subscriptionId,
+    private record BillingPeriod(Long id, Long tenantId, Long accountId, Long subscriptionId,
                                  Long priceVersionId, String currency, Long baseAmountMinor,
                                  LocalDateTime periodStart, LocalDateTime periodEnd) {
     }
 
-    private record InvoiceRow(Long id, Long tenantId, Long subscriptionId, Long periodId,
+    private record InvoiceRow(Long id, Long tenantId, Long accountId, Long subscriptionId, Long periodId,
                               Long priceVersionId, String currency, LocalDateTime periodStart,
                               LocalDateTime periodEnd, Long baseAmountMinor, Long usageAmountMinor,
                               Long totalAmountMinor, String status, LocalDateTime issuedAt) {

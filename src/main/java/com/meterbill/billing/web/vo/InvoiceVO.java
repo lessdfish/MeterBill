@@ -6,6 +6,7 @@ import java.util.List;
 public record InvoiceVO(
         Long id,
         Long tenantId,
+        Long accountId,
         Long subscriptionId,
         Long periodId,
         Long priceVersionId,

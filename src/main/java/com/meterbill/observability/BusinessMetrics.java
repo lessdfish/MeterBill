@@ -4,6 +4,7 @@ import io.micrometer.core.instrument.Counter;
 import io.micrometer.core.instrument.Gauge;
 import io.micrometer.core.instrument.MeterRegistry;
 import lombok.extern.slf4j.Slf4j;
+import org.springframework.beans.factory.annotation.Value;
 import org.springframework.jdbc.core.JdbcTemplate;
 import org.springframework.scheduling.annotation.Scheduled;
 import org.springframework.stereotype.Component;
@@ -25,6 +26,9 @@ public class BusinessMetrics {
     private final Counter consumerFinalFailures;
     private final Counter outboxRetries;
     private final Counter outboxFinalFailures;
+
+    @Value("${meterbill.observability.metrics-refresh-enabled:true}")
+    private boolean metricsRefreshEnabled;
 
     public BusinessMetrics(JdbcTemplate jdbc, MeterRegistry registry) {
         this.jdbc = jdbc;
@@ -53,6 +57,9 @@ public class BusinessMetrics {
 
     @Scheduled(fixedDelayString = "${meterbill.observability.refresh-interval:15000}")
     public void refresh() {
+        if (!metricsRefreshEnabled) {
+            return;
+        }
         try {
             outboxBacklog.set(value("SELECT COUNT(*) FROM mb_outbox WHERE status IN ('READY','PUBLISHING','RETRYABLE_FAILED')"));
             oldestOutboxSeconds.set(value("SELECT COALESCE(MAX(TIMESTAMPDIFF(SECOND,created_at,UTC_TIMESTAMP())),0) FROM mb_outbox WHERE status IN ('READY','PUBLISHING','RETRYABLE_FAILED')"));

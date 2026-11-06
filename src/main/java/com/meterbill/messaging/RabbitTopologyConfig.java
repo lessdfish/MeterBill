@@ -16,6 +16,15 @@ import org.springframework.beans.factory.annotation.Qualifier;
         havingValue = "true", matchIfMissing = true)
 public class RabbitTopologyConfig {
 
+    private final String queueType;
+
+    RabbitTopologyConfig(@Value("${meterbill.messaging.queue-type:classic}") String queueType) {
+        if (!"classic".equalsIgnoreCase(queueType) && !"quorum".equalsIgnoreCase(queueType)) {
+            throw new IllegalArgumentException("Unsupported RabbitMQ queue type: " + queueType);
+        }
+        this.queueType = queueType;
+    }
+
     @Bean
     DirectExchange usageExchange() {
         return new DirectExchange(MessagingTopology.USAGE_EXCHANGE, true, false);
@@ -33,12 +42,12 @@ public class RabbitTopologyConfig {
 
     @Bean
     Queue usageQueue() {
-        return QueueBuilder.durable(MessagingTopology.USAGE_QUEUE).build();
+        return queue(MessagingTopology.USAGE_QUEUE).build();
     }
 
     @Bean
     Queue retryQueue(@Value("${meterbill.messaging.retry-delay-ms:5000}") int delayMs) {
-        return QueueBuilder.durable(MessagingTopology.RETRY_QUEUE)
+        return queue(MessagingTopology.RETRY_QUEUE)
                 .ttl(delayMs)
                 .deadLetterExchange(MessagingTopology.USAGE_EXCHANGE)
                 .deadLetterRoutingKey(MessagingTopology.USAGE_ROUTING_KEY)
@@ -47,7 +56,12 @@ public class RabbitTopologyConfig {
 
     @Bean
     Queue failedQueue() {
-        return QueueBuilder.durable(MessagingTopology.FAILED_QUEUE).build();
+        return queue(MessagingTopology.FAILED_QUEUE).build();
+    }
+
+    private QueueBuilder queue(String name) {
+        QueueBuilder builder = QueueBuilder.durable(name);
+        return "quorum".equalsIgnoreCase(queueType) ? builder.quorum() : builder;
     }
 
     @Bean

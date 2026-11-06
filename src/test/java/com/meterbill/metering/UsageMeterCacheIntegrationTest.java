@@ -30,6 +30,7 @@ import static org.junit.jupiter.api.Assertions.assertTrue;
 
 @Testcontainers
 @SpringBootTest
+@org.springframework.test.annotation.DirtiesContext(classMode = org.springframework.test.annotation.DirtiesContext.ClassMode.AFTER_CLASS)
 @ActiveProfiles("test")
 class UsageMeterCacheIntegrationTest {
 
@@ -119,6 +120,12 @@ class UsageMeterCacheIntegrationTest {
         jdbc.update("INSERT INTO mb_tenant(tenant_code, name) VALUES (?, ?)",
                 "cache-" + suffix, "Cache Test");
         Long tenantId = jdbc.queryForObject("SELECT LAST_INSERT_ID()", Long.class);
+        jdbc.update("""
+                INSERT INTO mb_customer_account
+                    (tenant_id, external_key, name, currency, time_zone_id, is_default)
+                VALUES (?, ?, 'Cache Account', 'CNY', 'UTC', TRUE)
+                """, tenantId, "cache-account-" + suffix);
+        Long accountId = jdbc.queryForObject("SELECT LAST_INSERT_ID()", Long.class);
         jdbc.update("INSERT INTO mb_tenant(tenant_code, name) VALUES (?, ?)",
                 "cache-other-" + suffix, "Cache Other Tenant");
         Long otherTenantId = jdbc.queryForObject("SELECT LAST_INSERT_ID()", Long.class);
@@ -149,9 +156,10 @@ class UsageMeterCacheIntegrationTest {
         Long versionId = jdbc.queryForObject("SELECT LAST_INSERT_ID()", Long.class);
         jdbc.update("INSERT INTO mb_usage_price_rule(price_version_id,meter_id,pricing_mode,included_quantity,unit_amount_minor) VALUES (?,?,'PER_UNIT',0,1)", versionId, meterId);
         jdbc.update("""
-                INSERT INTO mb_subscription(tenant_id, plan_id, idempotency_key, request_hash, status)
-                VALUES (?, ?, ?, ?, 'ACTIVE')
-                """, tenantId, planId, "cache-sub-" + suffix, "0".repeat(64));
+                INSERT INTO mb_subscription
+                    (tenant_id, account_id, plan_id, idempotency_key, request_hash, status)
+                VALUES (?, ?, ?, ?, ?, 'ACTIVE')
+                """, tenantId, accountId, planId, "cache-sub-" + suffix, "0".repeat(64));
         Long subscriptionId = jdbc.queryForObject("SELECT LAST_INSERT_ID()", Long.class);
         LocalDateTime start = LocalDateTime.ofInstant(Instant.now().minusSeconds(86400), ZoneOffset.UTC);
         LocalDateTime end = LocalDateTime.ofInstant(Instant.now().plusSeconds(86400), ZoneOffset.UTC);

@@ -24,14 +24,14 @@ $null=Api 'G02 tenant cannot query channel' POST "/api/v1/platform/payments/$($p
 $paid=Api 'G02 recover by query' POST "/api/v1/platform/payments/$($payment.id)/query-channel" $admin
 Check 'G02 query converges' ($paid.status -eq 'SUCCEEDED') "status=$($paid.status)"
 $null=Api 'G02 query idempotent' POST "/api/v1/platform/payments/$($payment.id)/query-channel" $admin
-$null=Api 'G02 tenant reversal denied' POST "/api/v1/platform/payments/$($payment.id)/reversal" $hA @{reason='Acceptance receipt correction'} @(403)
-$reversal=Api 'G02 reverse successful payment' POST "/api/v1/platform/payments/$($payment.id)/reversal" $admin @{reason='Acceptance receipt correction'}
-$again=Api 'G02 repeat reversal' POST "/api/v1/platform/payments/$($payment.id)/reversal" $admin @{reason='Acceptance receipt correction'}
-Check 'G02 one reversal' ($reversal -eq $again) "id=$reversal"
-$unpaid=Api 'G02 invoice after reversal' GET "/api/v1/tenant/invoices/$invoiceId" $hA
+$null=Api 'G02 tenant revocation denied' POST "/api/v1/platform/payments/$($payment.id)/revoke" $hA @{reason='Acceptance receipt correction'} @(403)
+$revocation=Api 'G02 revoke successful payment' POST "/api/v1/platform/payments/$($payment.id)/revoke" $admin @{reason='Acceptance receipt correction'}
+$again=Api 'G02 repeat revocation' POST "/api/v1/platform/payments/$($payment.id)/revoke" $admin @{reason='Acceptance receipt correction'}
+Check 'G02 one revocation' ($revocation -eq $again) "id=$revocation"
+$unpaid=Api 'G02 invoice after revocation' GET "/api/v1/tenant/invoices/$invoiceId" $hA
 Check 'G02 obligation restored history unchanged' ($unpaid.status -eq 'ISSUED' -and $unpaid.totalAmountMinor -eq $invoice.totalAmountMinor) "status=$($unpaid.status),total=$($unpaid.totalAmountMinor)"
-$null=Api 'G02 reversed payment cannot refund' POST "/api/v1/tenant/payments/$($payment.id)/refunds" $hA @{amountMinor=1} @(409) "$Run-refund-denied"
-$null=Api 'G02 refunded payment cannot reverse' POST "/api/v1/platform/payments/$($state.payment)/reversal" $admin @{reason='Must be denied'} @(409)
+$null=Api 'G02 revoked payment cannot refund' POST "/api/v1/tenant/payments/$($payment.id)/refunds" $hA @{amountMinor=1} @(409) "$Run-refund-denied"
+$null=Api 'G02 refunded payment cannot revoke' POST "/api/v1/platform/payments/$($state.payment)/revoke" $admin @{reason='Must be denied'} @(409)
 $rec=Api 'G03 final complete reconciliation' POST /api/v1/tenant/reconciliation/runs $hA $null @(200) ([guid]::NewGuid().ToString())
-Check 'G03 no differences after query and reversal' ($rec.differences.Count -eq 0) ($rec|ConvertTo-Json -Compress -Depth 8)
+Check 'G03 no differences after query and revocation' ($rec.differences.Count -eq 0) ($rec|ConvertTo-Json -Compress -Depth 8)
 if(@($checks|Where-Object status -eq FAIL).Count){throw 'Live feature checks failed'}

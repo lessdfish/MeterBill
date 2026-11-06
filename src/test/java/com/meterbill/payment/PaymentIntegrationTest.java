@@ -37,6 +37,7 @@ import static org.junit.jupiter.api.Assertions.assertTrue;
 
 @Testcontainers
 @SpringBootTest
+@org.springframework.test.annotation.DirtiesContext(classMode = org.springframework.test.annotation.DirtiesContext.ClassMode.AFTER_CLASS)
 @ActiveProfiles("test")
 class PaymentIntegrationTest {
 
@@ -64,6 +65,12 @@ class PaymentIntegrationTest {
 
     @Autowired
     private LedgerService ledger;
+
+    @Autowired
+    private com.meterbill.payment.service.PaymentTransactionService paymentTransactions;
+
+    @Autowired
+    private com.meterbill.billing.api.AccountBalanceApi balances;
 
     @Test
     void paymentAndRefundCallbacksAreIdempotentAndEveryPostingBalances() throws Exception {
@@ -101,6 +108,26 @@ class PaymentIntegrationTest {
         assertEquals("UNKNOWN", payments.simulateRefundResult(refund.id(), null, "UNKNOWN").status());
         assertEquals("SUCCEEDED", payments.simulateRefundResult(refund.id(), null, "SUCCEEDED").status());
         payments.simulateRefundResult(refund.id(), null, "SUCCEEDED");
+
+        assertEquals(3, paymentTransactions.forPayment(fixture.tenantId(), first.id()).size());
+        assertEquals(3, paymentTransactions.forRefund(fixture.tenantId(), refund.id()).size());
+        var balance = balances.balance(fixture.tenantId(), first.accountId());
+        assertEquals(1000L, balance.invoicedMinor());
+        assertEquals(1000L, balance.paidMinor());
+        assertEquals(500L, balance.refundedMinor());
+        assertEquals(500L, balance.balanceMinor());
+        assertEquals("PARTIALLY_PAID", invoiceStatus(fixture.invoiceId()));
+        assertEquals(500L, jdbc.queryForObject("""
+                SELECT COALESCE(SUM(CASE e.direction
+                    WHEN 'DEBIT' THEN e.amount_minor ELSE -e.amount_minor END), 0)
+                FROM mb_ledger_entry e
+                JOIN mb_ledger_account a ON a.id = e.account_id
+                WHERE a.tenant_id = ? AND a.account_code = 'AR'
+                """, Long.class, fixture.tenantId()));
+        assertEquals(8L, jdbc.queryForObject("""
+                SELECT COUNT(*) FROM mb_domain_event
+                WHERE tenant_id = ? AND aggregate_type IN ('PAYMENT', 'REFUND')
+                """, Long.class, fixture.tenantId()));
 
         assertEquals(2, jdbc.queryForObject("""
                 SELECT COUNT(*) FROM mb_ledger_transaction
@@ -192,34 +219,34 @@ class PaymentIntegrationTest {
     }
 
     @Test
-    void reversalIsAtomicIdempotentRestoresReceivableAndDisallowsRefunds() throws Exception {
+    void revocationIsAtomicIdempotentRestoresReceivableAndDisallowsRefunds() throws Exception {
         Fixture f=createInvoice();
-        var p=payments.createPayment(f.tenantId(),f.invoiceId(),"reverse",1000L,null);
+        var p=payments.createPayment(f.tenantId(),f.invoiceId(),"revoke",1000L,null);
         payments.simulatePaymentResult(p.id(),null,"SUCCEEDED");
         assertEquals("PAID",invoiceStatus(f.invoiceId()));
         jdbc.update("UPDATE mb_channel_transaction SET amount_minor=999 WHERE payment_id=?",p.id());
-        assertThrows(BusinessException.class,()->payments.reversePayment(p.id(),101L,"Wrong simulated receipt"));
+        assertThrows(BusinessException.class,()->payments.revokePayment(p.id(),101L,"Wrong simulated receipt"));
         jdbc.update("UPDATE mb_channel_transaction SET amount_minor=1000 WHERE payment_id=?",p.id());
-        Long reversal=payments.reversePayment(p.id(),101L,"Wrong simulated receipt");
-        assertEquals(reversal,payments.reversePayment(p.id(),101L,"Wrong simulated receipt"));
-        assertEquals("REVERSED",payments.getPayment(f.tenantId(),p.id()).status());
+        Long revocation=payments.revokePayment(p.id(),101L,"Wrong simulated receipt");
+        assertEquals(revocation,payments.revokePayment(p.id(),101L,"Wrong simulated receipt"));
+        assertEquals("REVOKED",payments.getPayment(f.tenantId(),p.id()).status());
         assertEquals("ISSUED",invoiceStatus(f.invoiceId()));
         assertTrue(ledger.isBalanced(f.tenantId()));
-        assertTrue(reconciliation.run(f.tenantId(),"reversed",null).differences().isEmpty());
+        assertTrue(reconciliation.run(f.tenantId(),"revoked",null).differences().isEmpty());
         assertThrows(BusinessException.class,()->payments.requestRefund(f.tenantId(),p.id(),"no-refund",1L,null));
         assertThrows(BusinessException.class,()->payments.simulatePaymentResult(p.id(),null,"SUCCEEDED"));
-        assertThrows(BusinessException.class,()->payments.reversePayment(p.id(),101L,"different reason"));
+        assertThrows(BusinessException.class,()->payments.revokePayment(p.id(),101L,"different reason"));
         var second=payments.createPayment(f.tenantId(),f.invoiceId(),"repay",1000L,null);
         payments.simulatePaymentResult(second.id(),null,"SUCCEEDED");
         var refund=payments.requestRefund(f.tenantId(),second.id(),"blocks",1L,null);
-        assertThrows(BusinessException.class,()->payments.reversePayment(second.id(),101L,"blocked"));
+        assertThrows(BusinessException.class,()->payments.revokePayment(second.id(),101L,"blocked"));
         payments.simulateRefundResult(refund.id(),null,"UNKNOWN");
-        assertThrows(BusinessException.class,()->payments.reversePayment(second.id(),101L,"blocked"));
+        assertThrows(BusinessException.class,()->payments.revokePayment(second.id(),101L,"blocked"));
         payments.simulateRefundResult(refund.id(),null,"FAILED");
         jdbc.update("UPDATE mb_ledger_account SET status='CLOSED' WHERE tenant_id=? AND account_code='AR'",f.tenantId());
-        assertThrows(BusinessException.class,()->payments.reversePayment(second.id(),101L,"rollback"));
+        assertThrows(BusinessException.class,()->payments.revokePayment(second.id(),101L,"rollback"));
         assertEquals("SUCCEEDED",payments.getPayment(f.tenantId(),second.id()).status());
-        assertEquals(0,jdbc.queryForObject("SELECT COUNT(*) FROM mb_payment_reversal WHERE payment_id=?",Integer.class,second.id()));
+        assertEquals(0,jdbc.queryForObject("SELECT COUNT(*) FROM mb_payment_revocation WHERE payment_id=?",Integer.class,second.id()));
     }
 
     @Test
@@ -242,25 +269,65 @@ class PaymentIntegrationTest {
         assertTrue(unilateral.stream().anyMatch(d->d.differenceType().equals("INTERNAL_ORDER_MISSING")));
     }
     @Test
-    void concurrentRefundAndReversalCannotBothSucceed() throws Exception {
+    void concurrentRefundAndRevocationCannotBothSucceed() throws Exception {
         Fixture f=createInvoice();
-        var p=payments.createPayment(f.tenantId(),f.invoiceId(),"race-reversal",1000L,null);
+        var p=payments.createPayment(f.tenantId(),f.invoiceId(),"race-revocation",1000L,null);
         payments.simulatePaymentResult(p.id(),null,"SUCCEEDED");
         CountDownLatch start=new CountDownLatch(1);
         try(var pool=Executors.newFixedThreadPool(2)) {
-            var reverse=pool.submit(()->{start.await();try{payments.reversePayment(p.id(),101L,"race");return true;}catch(BusinessException e){return false;}});
+            var revoke=pool.submit(()->{start.await();try{payments.revokePayment(p.id(),101L,"race");return true;}catch(BusinessException e){return false;}});
             var refund=pool.submit(()->{start.await();try{payments.requestRefund(f.tenantId(),p.id(),"race-refund",100L,null);return true;}catch(BusinessException e){return false;}});
             start.countDown();
-            assertEquals(1,(reverse.get(10,TimeUnit.SECONDS)?1:0)+(refund.get(10,TimeUnit.SECONDS)?1:0));
+            assertEquals(1,(revoke.get(10,TimeUnit.SECONDS)?1:0)+(refund.get(10,TimeUnit.SECONDS)?1:0));
             assertTrue(ledger.isBalanced(f.tenantId()));
             assertTrue(reconciliation.run(f.tenantId(),"race",null).differences().isEmpty());
         }
     }
+
+    @Test
+    void successfulRefundCallbackAndRevocationUseOneLockOrder() throws Exception {
+        Fixture f = createInvoice();
+        var payment = payments.createPayment(f.tenantId(), f.invoiceId(),
+                "callback-revocation-" + f.suffix(), 1000L, null);
+        payments.simulatePaymentResult(payment.id(), null, "SUCCEEDED");
+        var refund = payments.requestRefund(f.tenantId(), payment.id(),
+                "callback-refund-" + f.suffix(), 100L, null);
+
+        CountDownLatch start = new CountDownLatch(1);
+        try (var pool = Executors.newFixedThreadPool(2)) {
+            Future<String> callback = pool.submit(() -> {
+                start.await();
+                return payments.simulateRefundResult(refund.id(), 101L, "SUCCEEDED").status();
+            });
+            Future<Boolean> revocation = pool.submit(() -> {
+                start.await();
+                try {
+                    payments.revokePayment(payment.id(), 101L, "concurrent refund callback");
+                    return true;
+                } catch (BusinessException ex) {
+                    return false;
+                }
+            });
+
+            start.countDown();
+            assertEquals("SUCCEEDED", callback.get(10, TimeUnit.SECONDS));
+            assertEquals(false, revocation.get(10, TimeUnit.SECONDS));
+            assertEquals("SUCCEEDED", payments.getPayment(f.tenantId(), payment.id()).status());
+            assertEquals("PARTIALLY_PAID", invoiceStatus(f.invoiceId()));
+            assertTrue(ledger.isBalanced(f.tenantId()));
+            var differences = reconciliation.run(f.tenantId(), "callback-revocation", null).differences();
+            assertTrue(differences.isEmpty(), differences::toString);
+        } catch (ExecutionException ex) {
+            throw new AssertionError("Refund callback and revocation lock order failed", ex.getCause());
+        }
+    }
+
     private Fixture createInvoice() throws Exception {
         String suffix = UUID.randomUUID().toString().replace("-", "");
         jdbc.update("INSERT INTO mb_tenant(tenant_code, name) VALUES (?, ?)",
                 "payment-" + suffix, "Payment Test");
         Long tenantId = jdbc.queryForObject("SELECT LAST_INSERT_ID()", Long.class);
+        Long accountId = accounts.requireDefault(tenantId).id();
         jdbc.update("INSERT INTO mb_product(product_code, name, status) VALUES (?, ?, 'ACTIVE')",
                 "payment-product-" + suffix, "Payment Product");
         Long productId = jdbc.queryForObject("SELECT LAST_INSERT_ID()", Long.class);
@@ -289,9 +356,9 @@ class PaymentIntegrationTest {
                 VALUES (?, ?, 'PER_UNIT', 0, 1)
                 """, versionId, meterId);
         jdbc.update("""
-                INSERT INTO mb_subscription(tenant_id, plan_id, idempotency_key, request_hash, status)
-                VALUES (?, ?, ?, ?, 'ACTIVE')
-                """, tenantId, planId, "payment-" + suffix, "0".repeat(64));
+                INSERT INTO mb_subscription(tenant_id, account_id, plan_id, idempotency_key, request_hash, status)
+                VALUES (?, ?, ?, ?, ?, 'ACTIVE')
+                """, tenantId, accountId, planId, "payment-" + suffix, "0".repeat(64));
         Long subscriptionId = jdbc.queryForObject("SELECT LAST_INSERT_ID()", Long.class);
         Instant now = Instant.now();
         LocalDateTime start = LocalDateTime.ofInstant(now.minusSeconds(90L * 86400), ZoneOffset.UTC);
@@ -313,4 +380,6 @@ class PaymentIntegrationTest {
 
     private record Fixture(Long tenantId, Long invoiceId, String suffix) {
     }
+
+    @Autowired private com.meterbill.account.api.AccountQueryApi accounts;
 }

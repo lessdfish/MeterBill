@@ -5,6 +5,7 @@ import java.time.Instant;
 public record SubscriptionVO(
         Long id,
         Long tenantId,
+        Long accountId,
         Long planId,
         String status,
         Long priceVersionId,

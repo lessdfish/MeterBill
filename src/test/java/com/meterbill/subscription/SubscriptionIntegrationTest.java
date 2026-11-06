@@ -23,6 +23,7 @@ import java.time.ZoneOffset;
 import java.util.UUID;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 import static org.springframework.test.web.servlet.request.MockMvcRequestBuilders.get;
 import static org.springframework.test.web.servlet.request.MockMvcRequestBuilders.post;
@@ -31,6 +32,7 @@ import static org.springframework.test.web.servlet.result.MockMvcResultMatchers.
 
 @Testcontainers
 @SpringBootTest
+@org.springframework.test.annotation.DirtiesContext(classMode = org.springframework.test.annotation.DirtiesContext.ClassMode.AFTER_CLASS)
 @AutoConfigureMockMvc
 @ActiveProfiles("test")
 class SubscriptionIntegrationTest {
@@ -52,6 +54,7 @@ class SubscriptionIntegrationTest {
     @Autowired private JdbcTemplate jdbc;
     @Autowired private PasswordEncoder encoder;
     @Autowired private com.meterbill.identity.bootstrap.TenantRoleSetup roleSetup;
+    @Autowired private com.meterbill.account.service.AccountService accounts;
 
     private static final String PASSWORD = "TestPassword-2026!";
 
@@ -271,6 +274,122 @@ class SubscriptionIntegrationTest {
         assertEquals("PENDING", jdbc.queryForObject("""
                 SELECT status FROM mb_subscription WHERE id = ?
                 """, String.class, subscriptionId));
+    }
+
+    @Test
+    void activationSelectsPriceInTheCustomerAccountCurrency() throws Exception {
+        String token = login();
+        jdbc.update("INSERT INTO mb_price(plan_id, currency, billing_period) VALUES (?, 'EUR', 'MONTHLY')",
+                planId);
+        Long eurPriceId = jdbc.queryForObject("""
+                SELECT id FROM mb_price WHERE plan_id = ? AND currency = 'EUR'
+                """, Long.class, planId);
+        jdbc.update("""
+                INSERT INTO mb_price_version
+                    (price_id, version_no, base_amount_minor, status, effective_at)
+                VALUES (?, 1, 25900, 'PUBLISHED', DATE_SUB(UTC_TIMESTAMP(6), INTERVAL 14 DAY))
+                """, eurPriceId);
+
+        String accountJson = mvc.perform(post("/api/v1/tenant/accounts")
+                        .header("Authorization", "Bearer " + token)
+                        .header("X-Tenant-Id", tenantId)
+                        .contentType("application/json")
+                        .content("""
+                                {"externalKey":"eur-customer","name":"Euro Customer",
+                                 "currency":"EUR","timeZoneId":"Europe/Berlin"}
+                                """))
+                .andExpect(status().isOk())
+                .andReturn().getResponse().getContentAsString();
+        Long accountId = ((Number) JsonPath.read(accountJson, "$.data.id")).longValue();
+        String subscriptionJson = mvc.perform(post("/api/v1/tenant/subscriptions")
+                        .header("Authorization", "Bearer " + token)
+                        .header("X-Tenant-Id", tenantId)
+                        .header("Idempotency-Key", "eur-subscription")
+                        .contentType("application/json")
+                        .content("{\"accountId\":%d,\"planId\":%d}".formatted(accountId, planId)))
+                .andExpect(status().isOk())
+                .andReturn().getResponse().getContentAsString();
+        Long subscriptionId = ((Number) JsonPath.read(subscriptionJson, "$.data.id")).longValue();
+
+        mvc.perform(post("/api/v1/tenant/subscriptions/{id}/activate", subscriptionId)
+                        .header("Authorization", "Bearer " + token)
+                        .header("X-Tenant-Id", tenantId))
+                .andExpect(status().isOk())
+                .andExpect(jsonPath("$.data.currency").value("EUR"))
+                .andExpect(jsonPath("$.data.baseAmountMinor").value(25900));
+    }
+
+    @Test
+    void accountTimelineAndDomainEventsAreTenantScopedAndIdempotent() throws Exception {
+        String token = login();
+        String accountJson = mvc.perform(post("/api/v1/tenant/accounts")
+                        .header("Authorization", "Bearer " + token)
+                        .header("X-Tenant-Id", tenantId)
+                        .contentType("application/json")
+                        .content("""
+                                {"externalKey":"customer-001","name":"生产客户 A",
+                                 "email":"billing-a@example.test","currency":"CNY",
+                                 "timeZoneId":"Asia/Shanghai"}
+                                """))
+                .andExpect(status().isOk())
+                .andReturn().getResponse().getContentAsString();
+        Long accountId = ((Number) JsonPath.read(accountJson, "$.data.id")).longValue();
+
+        mvc.perform(get("/api/v1/tenant/accounts")
+                        .header("Authorization", "Bearer " + token)
+                        .header("X-Tenant-Id", tenantId))
+                .andExpect(status().isOk())
+                .andExpect(jsonPath("$.data.length()").value(2))
+                .andExpect(jsonPath("$.data[1].id").value(accountId));
+
+        mvc.perform(post("/api/v1/tenant/accounts")
+                        .header("Authorization", "Bearer " + token)
+                        .header("X-Tenant-Id", tenantId)
+                        .contentType("application/json")
+                        .content("""
+                                {"externalKey":"customer-001","name":"重复客户",
+                                 "currency":"CNY"}
+                                """))
+                .andExpect(status().isConflict());
+
+        String created = mvc.perform(post("/api/v1/tenant/subscriptions")
+                        .header("Authorization", "Bearer " + token)
+                        .header("X-Tenant-Id", tenantId)
+                        .header("Idempotency-Key", "account-subscription-1")
+                        .contentType("application/json")
+                        .content("{\"accountId\":%d,\"planId\":%d}".formatted(accountId, planId)))
+                .andExpect(status().isOk())
+                .andExpect(jsonPath("$.data.accountId").value(accountId))
+                .andReturn().getResponse().getContentAsString();
+        Long subscriptionId = ((Number) JsonPath.read(created, "$.data.id")).longValue();
+        mvc.perform(post("/api/v1/tenant/subscriptions")
+                        .header("Authorization", "Bearer " + token)
+                        .header("X-Tenant-Id", tenantId)
+                        .header("Idempotency-Key", "account-subscription-1")
+                        .contentType("application/json")
+                        .content("{\"accountId\":%d,\"planId\":%d}".formatted(accountId, planId)))
+                .andExpect(status().isOk())
+                .andExpect(jsonPath("$.data.id").value(subscriptionId));
+        activate(token, subscriptionId);
+
+        mvc.perform(get("/api/v1/tenant/subscriptions/{id}/timeline", subscriptionId)
+                        .header("Authorization", "Bearer " + token)
+                        .header("X-Tenant-Id", tenantId))
+                .andExpect(status().isOk())
+                .andExpect(jsonPath("$.data.length()").value(2))
+                .andExpect(jsonPath("$.data[0].eventType").value("CREATED"))
+                .andExpect(jsonPath("$.data[1].eventType").value("ACTIVATED"));
+
+        assertEquals(2L, jdbc.queryForObject("""
+                SELECT COUNT(*) FROM mb_domain_event
+                WHERE tenant_id = ? AND aggregate_type = 'SUBSCRIPTION' AND aggregate_id = ?
+                """, Long.class, tenantId, subscriptionId.toString()));
+        assertEquals(1L, jdbc.queryForObject("""
+                SELECT COUNT(*) FROM mb_domain_event
+                WHERE tenant_id = ? AND aggregate_type = 'ACCOUNT' AND aggregate_id = ?
+                """, Long.class, tenantId, accountId.toString()));
+        assertThrows(com.meterbill.common.exception.BusinessException.class,
+                () -> accounts.get(tenantId + 9999, accountId));
     }
 
     private Long createSubscription(String token, Long selectedPlan, String key) throws Exception {
